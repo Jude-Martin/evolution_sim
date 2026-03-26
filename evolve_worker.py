@@ -1,12 +1,13 @@
 import csv
 import random
 
+#To generate mutations in a VEEV sequence.  sets 1-4 below correspond to mutational preferences of polymerse variants
 # Standard DNA stop codons
 STOP_CODONS = {"TAA", "TAG", "TGA"}
 
 # Mutation probability matrices.
 # For each source nucleotide, the probabilities correspond to mutating
-# to the three alternative nucleotides in the order defined below.
+# to the three alternative nucleotides in the order defined in mutate_nucleotide().
 mutation_probabilities_set1_68U201 = {
     'A': [0.0406342 / 0.22313, 0.1569820 / 0.22313, 0.0255137 / 0.22313],
     'C': [0.0715498 / 0.258425, 0.1093084 / 0.258425, 0.0775670 / 0.258425],
@@ -57,9 +58,7 @@ def load_orf_regions(orffile: str):
         orf_name    start_1based    end_1based
 
     Coordinates are 1-based inclusive.
-
-    Each ORF length must be divisible by 3 because codons are parsed
-    independently within each ORF.
+    Each ORF length must be divisible by 3.
     """
     orfs = []
 
@@ -114,41 +113,19 @@ def mutate_nucleotide(nucleotide: str, mutation_probabilities: dict) -> str:
     )[0]
 
 
-def count_stop_codons_in_orfs(sequence: str, orfs):
+def list_stop_codons_in_orfs(sequence: str, orfs):
     """
-    Count stop codons only inside the supplied ORFs.
+    Return a list of all stop codons found inside ORFs.
 
-    Each ORF is read in-frame starting from its own start coordinate.
-    Sequence outside ORFs is ignored for stop-codon counting.
+    Each entry includes:
+      stop_codon
+      codon_start_1based
+      codon_index_global_1based
+      first_stop_orf_name
+      codon_index_within_orf_1based
     """
-    count = 0
+    stops = []
 
-    for orf in orfs:
-        start0 = orf["start_1based"] - 1
-        end0_exclusive = orf["end_1based"]
-
-        for i in range(start0, end0_exclusive - 2, 3):
-            codon = sequence[i:i+3]
-            if codon in STOP_CODONS:
-                count += 1
-
-    return count
-
-
-def first_stop_info_in_orfs(sequence: str, orfs):
-    """
-    Return metadata for the first stop codon encountered while scanning
-    ORFs in file order.
-
-    Returns:
-        stop_codon
-        codon_start_1based
-        codon_index_global_1based
-        first_stop_orf_name
-        codon_index_within_orf_1based
-
-    If no stop codon exists in any ORF, returns empty strings.
-    """
     for orf in orfs:
         start0 = orf["start_1based"] - 1
         end0_exclusive = orf["end_1based"]
@@ -158,15 +135,22 @@ def first_stop_info_in_orfs(sequence: str, orfs):
             codon_idx_within_orf += 1
             codon = sequence[i:i+3]
             if codon in STOP_CODONS:
-                return (
-                    codon,
-                    i + 1,
-                    (i // 3) + 1,
-                    orf["orf_name"],
-                    codon_idx_within_orf
-                )
+                stops.append({
+                    "stop_codon": codon,
+                    "codon_start_1based": i + 1,
+                    "codon_index_global_1based": (i // 3) + 1,
+                    "first_stop_orf_name": orf["orf_name"],
+                    "codon_index_within_orf_1based": codon_idx_within_orf,
+                })
 
-    return "", "", "", "", ""
+    return stops
+
+
+def count_stop_codons_in_orfs(sequence: str, orfs):
+    """
+    Count stop codons only inside the supplied ORFs.
+    """
+    return len(list_stop_codons_in_orfs(sequence, orfs))
 
 
 def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict, orfs):
@@ -188,10 +172,22 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
 
     final_seq = "".join(seq)
 
-    stop_count = count_stop_codons_in_orfs(final_seq, orfs)
-    stop_codon, codon_start_1based, codon_index_global_1based, first_stop_orf_name, codon_index_within_orf_1based = (
-        first_stop_info_in_orfs(final_seq, orfs)
-    )
+    stop_list = list_stop_codons_in_orfs(final_seq, orfs)
+    stop_count = len(stop_list)
+
+    if stop_list:
+        first = stop_list[0]
+        stop_codon = first["stop_codon"]
+        codon_start_1based = first["codon_start_1based"]
+        codon_index_global_1based = first["codon_index_global_1based"]
+        first_stop_orf_name = first["first_stop_orf_name"]
+        codon_index_within_orf_1based = first["codon_index_within_orf_1based"]
+    else:
+        stop_codon = ""
+        codon_start_1based = ""
+        codon_index_global_1based = ""
+        first_stop_orf_name = ""
+        codon_index_within_orf_1based = ""
 
     return {
         "sequence": final_seq,
@@ -202,7 +198,9 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
         "codon_index_global_1based": codon_index_global_1based,
         "first_stop_orf_name": first_stop_orf_name,
         "codon_index_within_orf_1based": codon_index_within_orf_1based,
-        "mutated_nt_index_1based": ""
+        "mutated_nt_index_1based": "",
+        # internal-use field for classification in run_evolution.py
+        "stop_signatures": stop_list,
     }
 
 
