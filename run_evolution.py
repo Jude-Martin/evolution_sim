@@ -3,6 +3,7 @@ import csv
 import math
 import os
 import random
+import statistics
 from collections import Counter
 from multiprocessing import Pool
 
@@ -133,6 +134,60 @@ def load_initial_parent(start_fasta: str):
     }]
 
 
+def get_stop_signature_set(sequence: str, orf_regions):
+    """
+    Build a set of stop-codon signatures from a sequence, restricted to ORFs.
+
+    Signature format:
+      (orf_name, codon_index_within_orf_1based, stop_codon)
+    """
+    signatures = set()
+
+    for orf in orf_regions:
+        start0 = orf["start_1based"] - 1
+        end0_exclusive = orf["end_1based"]
+
+        codon_idx_within_orf = 0
+        for i in range(start0, end0_exclusive - 2, 3):
+            codon_idx_within_orf += 1
+            codon = sequence[i:i+3]
+            if codon in {"TAA", "TAG", "TGA"}:
+                signatures.add(
+                    (orf["orf_name"], codon_idx_within_orf, codon)
+                )
+
+    return signatures
+
+
+def variant_has_novel_stop(variant, original_stop_signatures):
+    """
+    True if the variant contains at least one stop codon signature
+    not present in the original sequence.
+    """
+    if variant["stop_codon_count"] == 0:
+        return False
+
+    for stop in variant.get("stop_signatures", []):
+        sig = (
+            stop["first_stop_orf_name"],
+            stop["codon_index_within_orf_1based"],
+            stop["stop_codon"],
+        )
+        if sig not in original_stop_signatures:
+            return True
+
+    return False
+
+
+def safe_std(values):
+    """
+    Sample standard deviation if possible, else 0.0.
+    """
+    if len(values) <= 1:
+        return 0.0
+    return statistics.stdev(values)
+
+
 def parent_can_reproduce(parent, tolerated_stop_codons: int) -> bool:
     """
     Decide whether a parent can produce descendants.
@@ -189,7 +244,6 @@ def compute_rscu_vector(sequence: str, orf_regions):
         n_syn = len(codons)
 
         if total == 0:
-            # If no codons from this family appear, assign 0 to all
             for codon in codons:
                 rscu[codon] = 0.0
         else:
@@ -262,12 +316,6 @@ def get_reference_name_for_generation(generation: int, cycle_n: int, ref1_name: 
     - first n generations in each cycle use reference 1
     - generation n+1 uses reference 2
     - then the cycle repeats
-
-    Example if n = 4:
-      1,2,3,4 -> ref1
-      5       -> ref2
-      6,7,8,9 -> ref1
-      10      -> ref2
     """
     cycle_len = cycle_n + 1
     pos = (generation - 1) % cycle_len
@@ -441,6 +489,11 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                               total_realized_variants, fully_viable_variant_count,
                               stop_variant_count, taa_count, tag_count, tga_count,
                               mean_similarity_index_ref1, mean_similarity_index_ref2,
+                              std_similarity_index_ref1, std_similarity_index_ref2,
+                              proportion_variants_with_novel_stops,
+                              proportion_variants_with_only_original_stops,
+                              proportion_stop_variants_with_novel_stops,
+                              proportion_stop_variants_with_only_original_stops,
                               checkpoint_written):
     """
     Append one row of summary metrics for the current generation.
@@ -464,6 +517,12 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                 "TGA_count",
                 "mean_similarity_index_ref1",
                 "mean_similarity_index_ref2",
+                "std_similarity_index_ref1",
+                "std_similarity_index_ref2",
+                "proportion_variants_with_novel_stops",
+                "proportion_variants_with_only_original_stops",
+                "proportion_stop_variants_with_novel_stops",
+                "proportion_stop_variants_with_only_original_stops",
                 "checkpoint_written"
             ])
 
@@ -481,6 +540,12 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
             tga_count,
             mean_similarity_index_ref1,
             mean_similarity_index_ref2,
+            std_similarity_index_ref1,
+            std_similarity_index_ref2,
+            proportion_variants_with_novel_stops,
+            proportion_variants_with_only_original_stops,
+            proportion_stop_variants_with_novel_stops,
+            proportion_stop_variants_with_only_original_stops,
             int(checkpoint_written)
         ])
 
@@ -534,8 +599,11 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load initial parent and write generation-1 parent files
+    # Load initial parent and record original stop signatures for later comparison
     current_parents = load_initial_parent(args.start_fasta)
+    original_sequence = current_parents[0]["sequence"]
+    original_stop_signatures = get_stop_signature_set(original_sequence, orf_regions)
+
     write_parent_set(current_parents, os.path.join(args.output_dir, "gen_001_parents"))
 
     summary_path = os.path.join(args.output_dir, "generation_summaries.tsv")
@@ -585,7 +653,6 @@ def main():
             ref1_distances.append(dist_ref1)
             ref2_distances.append(dist_ref2)
 
-            # Active reference determines selection
             active_dist = cosine_distance(parent_rscu, active_reference_vector)
 
             parent["reference_used"] = reference_name
@@ -595,6 +662,9 @@ def main():
 
         mean_similarity_index_ref1 = sum(ref1_distances) / len(ref1_distances)
         mean_similarity_index_ref2 = sum(ref2_distances) / len(ref2_distances)
+
+        std_similarity_index_ref1 = safe_std(ref1_distances)
+        std_similarity_index_ref2 = safe_std(ref2_distances)
 
         # Lower cosine distance means more similar, so sort ascending
         parent_scores.sort(key=lambda x: x[1])
@@ -658,6 +728,29 @@ def main():
         fully_viable_variants = [v for v in all_variants if v["stop_codon_count"] == 0]
         stop_variants = [v for v in all_variants if v["stop_codon_count"] > 0]
 
+        novel_stop_variants = [
+            v for v in stop_variants
+            if variant_has_novel_stop(v, original_stop_signatures)
+        ]
+        nonnovel_stop_variants = [
+            v for v in stop_variants
+            if not variant_has_novel_stop(v, original_stop_signatures)
+        ]
+
+        if len(all_variants) > 0:
+            proportion_variants_with_novel_stops = len(novel_stop_variants) / len(all_variants)
+            proportion_variants_with_only_original_stops = len(nonnovel_stop_variants) / len(all_variants)
+        else:
+            proportion_variants_with_novel_stops = 0.0
+            proportion_variants_with_only_original_stops = 0.0
+
+        if len(stop_variants) > 0:
+            proportion_stop_variants_with_novel_stops = len(novel_stop_variants) / len(stop_variants)
+            proportion_stop_variants_with_only_original_stops = len(nonnovel_stop_variants) / len(stop_variants)
+        else:
+            proportion_stop_variants_with_novel_stops = 0.0
+            proportion_stop_variants_with_only_original_stops = 0.0
+
         stop_counter = Counter(v["stop_codon"] for v in stop_variants if v["stop_codon"])
         taa_count = stop_counter.get("TAA", 0)
         tag_count = stop_counter.get("TAG", 0)
@@ -713,10 +806,15 @@ def main():
             tga_count=tga_count,
             mean_similarity_index_ref1=mean_similarity_index_ref1,
             mean_similarity_index_ref2=mean_similarity_index_ref2,
+            std_similarity_index_ref1=std_similarity_index_ref1,
+            std_similarity_index_ref2=std_similarity_index_ref2,
+            proportion_variants_with_novel_stops=proportion_variants_with_novel_stops,
+            proportion_variants_with_only_original_stops=proportion_variants_with_only_original_stops,
+            proportion_stop_variants_with_novel_stops=proportion_stop_variants_with_novel_stops,
+            proportion_stop_variants_with_only_original_stops=proportion_stop_variants_with_only_original_stops,
             checkpoint_written=checkpoint_written
         )
 
-        # Move forward one generation
         current_parents = next_parents
 
     print(f"Done. Summary written to {summary_path}")
