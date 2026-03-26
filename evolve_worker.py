@@ -1,0 +1,236 @@
+import csv
+import random
+
+# Standard DNA stop codons
+STOP_CODONS = {"TAA", "TAG", "TGA"}
+
+# Mutation probability matrices.
+# For each source nucleotide, the probabilities correspond to mutating
+# to the three alternative nucleotides in the order defined below.
+mutation_probabilities_set1_68U201 = {
+    'A': [0.0406342 / 0.22313, 0.1569820 / 0.22313, 0.0255137 / 0.22313],
+    'C': [0.0715498 / 0.258425, 0.1093084 / 0.258425, 0.0775670 / 0.258425],
+    'G': [0.069933 / 0.138767, 0.0232894 / 0.138767, 0.0455444 / 0.138767],
+    'T': [0.08778562 / 0.37967764, 0.08651281 / 0.37967764, 0.20537921 / 0.37967764]
+}
+
+mutation_probabilities_set2_G7R = {
+    'A': [0.07799078 / 0.24349108, 0.13299544 / 0.24349108, 0.03250486 / 0.24349108],
+    'C': [0.08857339 / 0.239979, 0.08100787 / 0.239979, 0.07039774 / 0.239979],
+    'G': [0.07645003 / 0.19021658, 0.08419321 / 0.19021658, 0.02957334 / 0.19021658],
+    'T': [0.07249201 / 0.32631333, 0.10876877 / 0.32631333, 0.14505255 / 0.32631333]
+}
+
+mutation_probabilities_set3_3X = {
+    'A': [0.03321736 / 0.19424901, 0.1352778 / 0.19424901, 0.02575385 / 0.19424901],
+    'C': [0.07334453 / 0.22282149, 0.08144008 / 0.22282149, 0.06803688 / 0.22282149],
+    'G': [0.07667533 / 0.1873479, 0.09463397 / 0.1873479, 0.0160386 / 0.1873479],
+    'T': [0.14717589 / 0.39558158, 0.10889809 / 0.39558158, 0.13950761 / 0.39558158]
+}
+
+mutation_probabilities_set4_4X = {
+    'A': [0.02102178 / 0.17761079, 0.13136807 / 0.17761079, 0.02522094 / 0.17761079],
+    'C': [0.06261927 / 0.20481857, 0.08215234 / 0.20481857, 0.06004696 / 0.20481857],
+    'G': [0.13718076 / 0.24754165, 0.09510129 / 0.24754165, 0.0152596 / 0.24754165],
+    'T': [0.13576939 / 0.370029, 0.10137649 / 0.370029, 0.13288312 / 0.370029]
+}
+
+
+def get_mutation_probabilities(set_id: int):
+    """
+    Select one of the predefined mutation probability sets.
+    """
+    if set_id == 1:
+        return mutation_probabilities_set1_68U201
+    if set_id == 2:
+        return mutation_probabilities_set2_G7R
+    if set_id == 3:
+        return mutation_probabilities_set3_3X
+    if set_id == 4:
+        return mutation_probabilities_set4_4X
+    raise ValueError(f"Invalid mutation set: {set_id}")
+
+
+def load_orf_regions(orffile: str):
+    """
+    Load ORFs from a TSV with columns:
+        orf_name    start_1based    end_1based
+
+    Coordinates are 1-based inclusive.
+
+    Each ORF length must be divisible by 3 because codons are parsed
+    independently within each ORF.
+    """
+    orfs = []
+
+    with open(orffile, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+
+        required = {"orf_name", "start_1based", "end_1based"}
+        if not required.issubset(reader.fieldnames or set()):
+            raise ValueError(f"ORF TSV must contain columns: {sorted(required)}")
+
+        for row in reader:
+            start = int(row["start_1based"])
+            end = int(row["end_1based"])
+
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid ORF coordinates: {row}")
+
+            length = end - start + 1
+            if length % 3 != 0:
+                raise ValueError(
+                    f"ORF length is not divisible by 3: {row['orf_name']} "
+                    f"{start}-{end} ({length} nt)"
+                )
+
+            orfs.append({
+                "orf_name": row["orf_name"],
+                "start_1based": start,
+                "end_1based": end
+            })
+
+    if not orfs:
+        raise ValueError("No ORFs found in ORF TSV.")
+
+    return orfs
+
+
+def mutate_nucleotide(nucleotide: str, mutation_probabilities: dict) -> str:
+    """
+    Mutate one nucleotide according to the selected mutation matrix.
+    A nucleotide cannot mutate to itself.
+    """
+    mutation_outcomes = {
+        'A': ['C', 'G', 'T'],
+        'C': ['A', 'G', 'T'],
+        'G': ['A', 'C', 'T'],
+        'T': ['A', 'C', 'G']
+    }
+
+    return random.choices(
+        mutation_outcomes[nucleotide],
+        mutation_probabilities[nucleotide]
+    )[0]
+
+
+def count_stop_codons_in_orfs(sequence: str, orfs):
+    """
+    Count stop codons only inside the supplied ORFs.
+
+    Each ORF is read in-frame starting from its own start coordinate.
+    Sequence outside ORFs is ignored for stop-codon counting.
+    """
+    count = 0
+
+    for orf in orfs:
+        start0 = orf["start_1based"] - 1
+        end0_exclusive = orf["end_1based"]
+
+        for i in range(start0, end0_exclusive - 2, 3):
+            codon = sequence[i:i+3]
+            if codon in STOP_CODONS:
+                count += 1
+
+    return count
+
+
+def first_stop_info_in_orfs(sequence: str, orfs):
+    """
+    Return metadata for the first stop codon encountered while scanning
+    ORFs in file order.
+
+    Returns:
+        stop_codon
+        codon_start_1based
+        codon_index_global_1based
+        first_stop_orf_name
+        codon_index_within_orf_1based
+
+    If no stop codon exists in any ORF, returns empty strings.
+    """
+    for orf in orfs:
+        start0 = orf["start_1based"] - 1
+        end0_exclusive = orf["end_1based"]
+
+        codon_idx_within_orf = 0
+        for i in range(start0, end0_exclusive - 2, 3):
+            codon_idx_within_orf += 1
+            codon = sequence[i:i+3]
+            if codon in STOP_CODONS:
+                return (
+                    codon,
+                    i + 1,
+                    (i // 3) + 1,
+                    orf["orf_name"],
+                    codon_idx_within_orf
+                )
+
+    return "", "", "", "", ""
+
+
+def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict, orfs):
+    """
+    Simulate one descendant sequence from one parent.
+
+    Process:
+    - walk through every nucleotide
+    - mutate with probability mutation_rate
+    - build final mutated sequence
+    - count stop codons only inside ORFs
+    - return a dictionary describing this variant
+    """
+    seq = list(sequence)
+
+    for i in range(len(seq)):
+        if random.random() < mutation_rate:
+            seq[i] = mutate_nucleotide(seq[i], mutation_probabilities)
+
+    final_seq = "".join(seq)
+
+    stop_count = count_stop_codons_in_orfs(final_seq, orfs)
+    stop_codon, codon_start_1based, codon_index_global_1based, first_stop_orf_name, codon_index_within_orf_1based = (
+        first_stop_info_in_orfs(final_seq, orfs)
+    )
+
+    return {
+        "sequence": final_seq,
+        "stop_codon_count": stop_count,
+        "is_viable": (stop_count == 0),
+        "stop_codon": stop_codon,
+        "codon_start_1based": codon_start_1based,
+        "codon_index_global_1based": codon_index_global_1based,
+        "first_stop_orf_name": first_stop_orf_name,
+        "codon_index_within_orf_1based": codon_index_within_orf_1based,
+        "mutated_nt_index_1based": ""
+    }
+
+
+def simulate_parent_batch(args):
+    """
+    Simulate many descendants from one parent.
+
+    Arguments:
+        parent_id
+        parent_seq
+        n_sims
+        mutation_rate
+        mutation_probabilities
+        orfs
+        seed
+
+    Returns:
+        list of variant dictionaries
+    """
+    parent_id, parent_seq, n_sims, mutation_rate, mutation_probabilities, orfs, seed = args
+    random.seed(seed)
+
+    variants = []
+
+    for sim_idx in range(1, n_sims + 1):
+        result = simulate_one(parent_seq, mutation_rate, mutation_probabilities, orfs)
+        result["simulation_index"] = sim_idx
+        result["source_parent_id"] = parent_id
+        variants.append(result)
+
+    return variants
