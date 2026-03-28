@@ -1,7 +1,6 @@
 import csv
 import random
 
-#To generate mutations in a VEEV sequence.  sets 1-4 below correspond to mutational preferences of polymerse variants
 # Standard DNA stop codons
 STOP_CODONS = {"TAA", "TAG", "TGA"}
 
@@ -113,27 +112,47 @@ def mutate_nucleotide(nucleotide: str, mutation_probabilities: dict) -> str:
     )[0]
 
 
-def list_stop_codons_in_orfs(sequence: str, orfs):
+def analyze_orf_stops(sequence: str, orfs):
     """
-    Return a list of all stop codons found inside ORFs.
+    Analyze stop codons inside ORFs.
 
-    Each entry includes:
-      stop_codon
-      codon_start_1based
-      codon_index_global_1based
-      first_stop_orf_name
-      codon_index_within_orf_1based
+    For each ORF:
+    - the terminal codon is expected to be a stop codon
+    - any stop codon elsewhere in the ORF counts as an additional stop
+
+    Returns a dictionary with:
+      total_stop_codon_count
+      expected_terminal_stop_count
+      additional_stop_codon_count
+      terminal_stop_missing_count
+      stop_list
+
+    stop_list contains every stop codon found in ORFs and marks whether
+    each one is the terminal ORF stop.
     """
     stops = []
+    expected_terminal_stop_count = 0
+    terminal_stop_missing_count = 0
 
     for orf in orfs:
         start0 = orf["start_1based"] - 1
-        end0_exclusive = orf["end_1based"]
+        end1 = orf["end_1based"]
+        end0_exclusive = end1
+
+        # Terminal codon for this ORF
+        terminal_start0 = end1 - 3
+        terminal_codon = sequence[terminal_start0:end1]
+
+        if terminal_codon in STOP_CODONS:
+            expected_terminal_stop_count += 1
+        else:
+            terminal_stop_missing_count += 1
 
         codon_idx_within_orf = 0
         for i in range(start0, end0_exclusive - 2, 3):
             codon_idx_within_orf += 1
             codon = sequence[i:i+3]
+
             if codon in STOP_CODONS:
                 stops.append({
                     "stop_codon": codon,
@@ -141,16 +160,19 @@ def list_stop_codons_in_orfs(sequence: str, orfs):
                     "codon_index_global_1based": (i // 3) + 1,
                     "first_stop_orf_name": orf["orf_name"],
                     "codon_index_within_orf_1based": codon_idx_within_orf,
+                    "is_terminal_orf_stop": (i == terminal_start0),
                 })
 
-    return stops
+    total_stop_codon_count = len(stops)
+    additional_stop_codon_count = total_stop_codon_count - expected_terminal_stop_count
 
-
-def count_stop_codons_in_orfs(sequence: str, orfs):
-    """
-    Count stop codons only inside the supplied ORFs.
-    """
-    return len(list_stop_codons_in_orfs(sequence, orfs))
+    return {
+        "total_stop_codon_count": total_stop_codon_count,
+        "expected_terminal_stop_count": expected_terminal_stop_count,
+        "additional_stop_codon_count": additional_stop_codon_count,
+        "terminal_stop_missing_count": terminal_stop_missing_count,
+        "stop_list": stops,
+    }
 
 
 def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict, orfs):
@@ -161,8 +183,8 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
     - walk through every nucleotide
     - mutate with probability mutation_rate
     - build final mutated sequence
-    - count stop codons only inside ORFs
-    - return a dictionary describing this variant
+    - analyze stop codons only inside ORFs
+    - distinguish expected terminal ORF stops from additional stops
     """
     seq = list(sequence)
 
@@ -171,9 +193,8 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
             seq[i] = mutate_nucleotide(seq[i], mutation_probabilities)
 
     final_seq = "".join(seq)
-
-    stop_list = list_stop_codons_in_orfs(final_seq, orfs)
-    stop_count = len(stop_list)
+    stop_info = analyze_orf_stops(final_seq, orfs)
+    stop_list = stop_info["stop_list"]
 
     if stop_list:
         first = stop_list[0]
@@ -191,8 +212,14 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
 
     return {
         "sequence": final_seq,
-        "stop_codon_count": stop_count,
-        "is_viable": (stop_count == 0),
+        "total_stop_codon_count": stop_info["total_stop_codon_count"],
+        "expected_terminal_stop_count": stop_info["expected_terminal_stop_count"],
+        "additional_stop_codon_count": stop_info["additional_stop_codon_count"],
+        "terminal_stop_missing_count": stop_info["terminal_stop_missing_count"],
+        "is_viable": (
+            stop_info["terminal_stop_missing_count"] == 0
+            and stop_info["additional_stop_codon_count"] == 0
+        ),
         "stop_codon": stop_codon,
         "codon_start_1based": codon_start_1based,
         "codon_index_global_1based": codon_index_global_1based,
