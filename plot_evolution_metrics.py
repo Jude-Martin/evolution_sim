@@ -1,3 +1,4 @@
+
 import argparse
 import csv
 import os
@@ -18,9 +19,12 @@ def load_summary_tsv(path):
                 "mean_similarity_index_ref2": float(row["mean_similarity_index_ref2"]),
                 "std_similarity_index_ref1": float(row["std_similarity_index_ref1"]),
                 "std_similarity_index_ref2": float(row["std_similarity_index_ref2"]),
-                "stop_variant_count": int(row["stop_variant_count"]),
+                "additional_stop_variant_count": int(row["additional_stop_variant_count"]),
+                "structurally_valid_variant_count": int(row["structurally_valid_variant_count"]),
                 "proportion_variants_with_novel_stops": float(row["proportion_variants_with_novel_stops"]),
                 "proportion_variants_with_only_original_stops": float(row["proportion_variants_with_only_original_stops"]),
+                "proportion_stop_variants_with_novel_stops": float(row["proportion_stop_variants_with_novel_stops"]),
+                "proportion_stop_variants_with_only_original_stops": float(row["proportion_stop_variants_with_only_original_stops"]),
                 "reference_used": row["reference_used"],
             })
     return rows
@@ -42,8 +46,22 @@ def plot_similarity(rows, output_path):
     std_ref2 = [r["std_similarity_index_ref2"] for r in rows]
 
     plt.figure(figsize=(8, 5))
-    plt.errorbar(generations, sim_ref1, yerr=std_ref1, fmt='-o', capsize=3, label="Mean Similarity Index to ref1")
-    plt.errorbar(generations, sim_ref2, yerr=std_ref2, fmt='-o', capsize=3, label="Mean Similarity Index to ref2")
+    plt.errorbar(
+        generations,
+        sim_ref1,
+        yerr=std_ref1,
+        fmt='-o',
+        capsize=3,
+        label="Mean Similarity Index to ref1"
+    )
+    plt.errorbar(
+        generations,
+        sim_ref2,
+        yerr=std_ref2,
+        fmt='-o',
+        capsize=3,
+        label="Mean Similarity Index to ref2"
+    )
     plt.xlabel("Generation")
     plt.ylabel("Similarity Index (cosine distance)")
     plt.title("Mean Similarity Index over Time")
@@ -53,39 +71,85 @@ def plot_similarity(rows, output_path):
     plt.close()
 
 
-def plot_stop_counts(rows, output_path):
+def plot_additional_stop_counts(rows, output_path):
     """
-    Plot number of stop-containing variants generated per generation.
+    Plot the number of variants per generation that contain additional
+    stop codons and/or are missing required terminal ORF stops.
+
+    This excludes sequences that only contain the expected terminal ORF stops.
     """
     generations = [r["generation"] for r in rows]
-    stop_counts = [r["stop_variant_count"] for r in rows]
+    stop_counts = [r["additional_stop_variant_count"] for r in rows]
 
     plt.figure(figsize=(8, 5))
     plt.plot(generations, stop_counts, marker='o')
     plt.xlabel("Generation")
-    plt.ylabel("Number of Stop-Containing Variants")
-    plt.title("Stop Variants Generated over Time")
+    plt.ylabel("Number of variants with additional stop issues")
+    plt.title("Additional Stop Variants over Time")
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_stop_proportions(rows, output_path):
+def plot_structurally_valid_counts(rows, output_path):
     """
-    Plot proportion of each generation's variants that contain:
-    - novel stop codons not present in the original sequence
-    - only stop codons already present in the original sequence
+    Plot the number of structurally valid variants per generation.
+
+    A structurally valid variant has:
+    - all expected terminal ORF stops present
+    - no additional stop codons
+    """
+    generations = [r["generation"] for r in rows]
+    valid_counts = [r["structurally_valid_variant_count"] for r in rows]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(generations, valid_counts, marker='o')
+    plt.xlabel("Generation")
+    plt.ylabel("Number of structurally valid variants")
+    plt.title("Structurally Valid Variants over Time")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_additional_stop_proportions(rows, output_path):
+    """
+    Plot the proportion of all generated variants that contain:
+    - novel stop issues not present in the original sequence
+    - only stop issues already present in the original sequence
     """
     generations = [r["generation"] for r in rows]
     novel = [r["proportion_variants_with_novel_stops"] for r in rows]
     original_only = [r["proportion_variants_with_only_original_stops"] for r in rows]
 
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, novel, marker='o', label="Novel stop codons")
-    plt.plot(generations, original_only, marker='o', label="Only original stop codons")
+    plt.plot(generations, novel, marker='o', label="Novel stop issues")
+    plt.plot(generations, original_only, marker='o', label="Only original stop issues")
     plt.xlabel("Generation")
     plt.ylabel("Proportion of all generated variants")
-    plt.title("Stop-Codon Composition over Time")
+    plt.title("Additional Stop Composition over Time")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_stop_issue_breakdown(rows, output_path):
+    """
+    Plot the proportion among stop-issue variants only:
+    - novel stop issues
+    - only original stop issues
+    """
+    generations = [r["generation"] for r in rows]
+    novel = [r["proportion_stop_variants_with_novel_stops"] for r in rows]
+    original_only = [r["proportion_stop_variants_with_only_original_stops"] for r in rows]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(generations, novel, marker='o', label="Novel stop issues")
+    plt.plot(generations, original_only, marker='o', label="Only original stop issues")
+    plt.xlabel("Generation")
+    plt.ylabel("Proportion of stop-issue variants")
+    plt.title("Breakdown of Additional Stop Variants")
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
@@ -106,13 +170,21 @@ def main():
         rows,
         os.path.join(args.output_dir, "mean_similarity_index_over_time.png")
     )
-    plot_stop_counts(
+    plot_additional_stop_counts(
         rows,
-        os.path.join(args.output_dir, "stop_variant_count_over_time.png")
+        os.path.join(args.output_dir, "additional_stop_variant_count_over_time.png")
     )
-    plot_stop_proportions(
+    plot_structurally_valid_counts(
         rows,
-        os.path.join(args.output_dir, "stop_proportions_over_time.png")
+        os.path.join(args.output_dir, "structurally_valid_variant_count_over_time.png")
+    )
+    plot_additional_stop_proportions(
+        rows,
+        os.path.join(args.output_dir, "additional_stop_proportions_over_time.png")
+    )
+    plot_stop_issue_breakdown(
+        rows,
+        os.path.join(args.output_dir, "additional_stop_breakdown_over_time.png")
     )
 
     print(f"Wrote plots to {args.output_dir}")
