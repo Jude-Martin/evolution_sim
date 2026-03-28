@@ -13,9 +13,12 @@ from Bio.SeqRecord import SeqRecord
 
 from evolve_worker import (
     analyze_orf_stops,
+    build_stop_signature_set,
+    build_terminal_stop_signature_set,
     get_mutation_probabilities,
     load_orf_regions,
     simulate_parent_batch,
+    summarize_stops_against_expected,
 )
 
 # User-specified amino acid order
@@ -109,16 +112,23 @@ def load_config_tsv(path):
     return config
 
 
-def load_initial_parent(start_fasta: str, orf_regions):
+def load_initial_parent(start_fasta: str, orf_regions,
+                        expected_stop_signatures,
+                        expected_terminal_stop_signatures):
     """
     Load the initial sequence from FASTA and analyze it using the same
-    ORF-stop logic as simulated variants.
+    expected-stop logic as simulated variants.
     """
     record = next(SeqIO.parse(start_fasta, "fasta"))
     sequence = str(record.seq)
 
-    stop_info = analyze_orf_stops(sequence, orf_regions)
-    stop_list = stop_info["stop_list"]
+    stop_summary = summarize_stops_against_expected(
+        sequence,
+        orf_regions,
+        expected_stop_signatures,
+        expected_terminal_stop_signatures
+    )
+    stop_list = stop_summary["stop_list"]
 
     if stop_list:
         first = stop_list[0]
@@ -137,13 +147,12 @@ def load_initial_parent(start_fasta: str, orf_regions):
     return [{
         "parent_id": record.id,
         "sequence": sequence,
-        "total_stop_codon_count": stop_info["total_stop_codon_count"],
-        "expected_terminal_stop_count": stop_info["expected_terminal_stop_count"],
-        "additional_stop_codon_count": stop_info["additional_stop_codon_count"],
-        "terminal_stop_missing_count": stop_info["terminal_stop_missing_count"],
+        "total_stop_codon_count": stop_summary["total_stop_codon_count"],
+        "novel_stop_codon_count": stop_summary["novel_stop_codon_count"],
+        "missing_expected_terminal_stop_count": stop_summary["missing_expected_terminal_stop_count"],
         "is_viable": (
-            stop_info["terminal_stop_missing_count"] == 0
-            and stop_info["additional_stop_codon_count"] == 0
+            stop_summary["missing_expected_terminal_stop_count"] == 0
+            and stop_summary["novel_stop_codon_count"] == 0
         ),
         "stop_codon": stop_codon,
         "codon_start_1based": codon_start_1based,
@@ -157,47 +166,28 @@ def load_initial_parent(start_fasta: str, orf_regions):
     }]
 
 
-def get_stop_signature_set(sequence: str, orf_regions):
+def get_original_stop_sets(start_fasta: str, orf_regions):
     """
-    Build a set of stop-codon signatures from a sequence, restricted to ORFs.
+    Read the start sequence and derive:
+    - expected_stop_signatures: all stop positions present in ORFs at the start
+    - expected_terminal_stop_signatures: subset of those that are terminal ORF stop positions
+    """
+    record = next(SeqIO.parse(start_fasta, "fasta"))
+    sequence = str(record.seq)
 
-    Signature format:
-      (orf_name, codon_index_within_orf_1based, stop_codon, is_terminal_orf_stop)
-    """
-    signatures = set()
     stop_info = analyze_orf_stops(sequence, orf_regions)
+    expected_stop_signatures = build_stop_signature_set(stop_info["stop_list"])
+    expected_terminal_stop_signatures = build_terminal_stop_signature_set(stop_info["stop_list"])
 
-    for stop in stop_info["stop_list"]:
-        signatures.add((
-            stop["first_stop_orf_name"],
-            stop["codon_index_within_orf_1based"],
-            stop["stop_codon"],
-            stop["is_terminal_orf_stop"],
-        ))
-
-    return signatures
+    return sequence, expected_stop_signatures, expected_terminal_stop_signatures
 
 
-def variant_has_novel_stop(variant, original_stop_signatures):
+def variant_has_novel_stop(variant):
     """
-    True if the variant contains at least one stop-codon signature
-    not present in the original sequence.
+    True if the variant contains at least one novel stop position
+    relative to the start sequence.
     """
-    additional = variant["additional_stop_codon_count"]
-    if additional == 0 and variant["terminal_stop_missing_count"] == 0:
-        return False
-
-    for stop in variant.get("stop_signatures", []):
-        sig = (
-            stop["first_stop_orf_name"],
-            stop["codon_index_within_orf_1based"],
-            stop["stop_codon"],
-            stop["is_terminal_orf_stop"],
-        )
-        if sig not in original_stop_signatures:
-            return True
-
-    return False
+    return variant["novel_stop_codon_count"] > 0
 
 
 def safe_std(values):
@@ -209,12 +199,12 @@ def safe_std(values):
 def parent_can_reproduce(parent, tolerated_additional_stop_codons: int) -> bool:
     """
     Parent can reproduce only if:
-    - every ORF still has its terminal stop codon
-    - additional stop codons are within tolerance
+    - all expected terminal stop positions are still occupied by a stop codon
+    - novel stop-position count is within tolerance
     """
     return (
-        parent["terminal_stop_missing_count"] == 0
-        and parent["additional_stop_codon_count"] <= tolerated_additional_stop_codons
+        parent["missing_expected_terminal_stop_count"] == 0
+        and parent["novel_stop_codon_count"] <= tolerated_additional_stop_codons
     )
 
 
@@ -387,9 +377,8 @@ def write_parent_set(parents, outdir):
         writer.writerow([
             "parent_id",
             "total_stop_codon_count",
-            "expected_terminal_stop_count",
-            "additional_stop_codon_count",
-            "terminal_stop_missing_count",
+            "novel_stop_codon_count",
+            "missing_expected_terminal_stop_count",
             "is_viable",
             "stop_codon",
             "codon_start_1based",
@@ -416,9 +405,8 @@ def write_parent_set(parents, outdir):
             writer.writerow([
                 parent["parent_id"],
                 parent["total_stop_codon_count"],
-                parent["expected_terminal_stop_count"],
-                parent["additional_stop_codon_count"],
-                parent["terminal_stop_missing_count"],
+                parent["novel_stop_codon_count"],
+                parent["missing_expected_terminal_stop_count"],
                 int(parent["is_viable"]),
                 parent["stop_codon"],
                 parent["codon_start_1based"],
@@ -449,9 +437,8 @@ def write_checkpoint_record(record_dir, generation, variants):
             "simulation_index",
             "source_parent_id",
             "total_stop_codon_count",
-            "expected_terminal_stop_count",
-            "additional_stop_codon_count",
-            "terminal_stop_missing_count",
+            "novel_stop_codon_count",
+            "missing_expected_terminal_stop_count",
             "is_viable",
             "stop_codon",
             "codon_start_1based",
@@ -470,9 +457,8 @@ def write_checkpoint_record(record_dir, generation, variants):
                 variant["simulation_index"],
                 variant["source_parent_id"],
                 variant["total_stop_codon_count"],
-                variant["expected_terminal_stop_count"],
-                variant["additional_stop_codon_count"],
-                variant["terminal_stop_missing_count"],
+                variant["novel_stop_codon_count"],
+                variant["missing_expected_terminal_stop_count"],
                 int(variant["is_viable"]),
                 variant["stop_codon"],
                 variant["codon_start_1based"],
@@ -483,7 +469,7 @@ def write_checkpoint_record(record_dir, generation, variants):
                 variant["sequence"]
             ])
 
-            if variant["additional_stop_codon_count"] == 0 and variant["terminal_stop_missing_count"] == 0:
+            if variant["missing_expected_terminal_stop_count"] == 0 and variant["novel_stop_codon_count"] == 0:
                 viable_out.write(f">gen{generation:03d}_viable_{viable_i}\n{variant['sequence']}\n")
                 viable_i += 1
             else:
@@ -494,7 +480,7 @@ def write_checkpoint_record(record_dir, generation, variants):
 def append_generation_summary(summary_path, generation, reference_used, sampled_parent_count,
                               reproductive_parent_count, total_requested_progeny,
                               total_realized_variants, structurally_valid_variant_count,
-                              additional_stop_variant_count, taa_count, tag_count, tga_count,
+                              novel_stop_variant_count, taa_count, tag_count, tga_count,
                               mean_similarity_index_ref1, mean_similarity_index_ref2,
                               std_similarity_index_ref1, std_similarity_index_ref2,
                               proportion_variants_with_novel_stops,
@@ -518,7 +504,7 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                 "total_requested_progeny",
                 "total_realized_variants",
                 "structurally_valid_variant_count",
-                "additional_stop_variant_count",
+                "novel_stop_variant_count",
                 "TAA_count",
                 "TAG_count",
                 "TGA_count",
@@ -541,7 +527,7 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
             total_requested_progeny,
             total_realized_variants,
             structurally_valid_variant_count,
-            additional_stop_variant_count,
+            novel_stop_variant_count,
             taa_count,
             tag_count,
             tga_count,
@@ -600,12 +586,19 @@ def main():
     rng = random.Random(seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    current_parents = load_initial_parent(args.start_fasta, orf_regions)
-    original_sequence = current_parents[0]["sequence"]
-    original_stop_signatures = get_stop_signature_set(original_sequence, orf_regions)
+    # Derive expected stop-position pattern from the start sequence itself
+    original_sequence, expected_stop_signatures, expected_terminal_stop_signatures = (
+        get_original_stop_sets(args.start_fasta, orf_regions)
+    )
+
+    current_parents = load_initial_parent(
+        args.start_fasta,
+        orf_regions,
+        expected_stop_signatures,
+        expected_terminal_stop_signatures
+    )
 
     write_parent_set(current_parents, os.path.join(args.output_dir, "gen_001_parents"))
-
     summary_path = os.path.join(args.output_dir, "generation_summaries.tsv")
 
     for generation in range(1, num_generations + 1):
@@ -632,7 +625,7 @@ def main():
         if not reproductive_parents:
             raise RuntimeError(
                 f"No parents available to produce generation {generation} "
-                f"under current additional-stop threshold."
+                f"under current novel-stop threshold."
             )
 
         parent_scores = []
@@ -703,6 +696,8 @@ def main():
                 mutation_rate,
                 mutation_probabilities,
                 orf_regions,
+                expected_stop_signatures,
+                expected_terminal_stop_signatures,
                 seed + generation * 100000 + parent_idx
             ))
 
@@ -716,37 +711,41 @@ def main():
 
         structurally_valid_variants = [
             v for v in all_variants
-            if v["terminal_stop_missing_count"] == 0 and v["additional_stop_codon_count"] == 0
+            if v["missing_expected_terminal_stop_count"] == 0 and v["novel_stop_codon_count"] == 0
         ]
-        additional_stop_variants = [
-            v for v in all_variants
-            if v["additional_stop_codon_count"] > 0 or v["terminal_stop_missing_count"] > 0
-        ]
-
         novel_stop_variants = [
-            v for v in additional_stop_variants
-            if variant_has_novel_stop(v, original_stop_signatures)
+            v for v in all_variants
+            if v["novel_stop_codon_count"] > 0
         ]
-        nonnovel_stop_variants = [
-            v for v in additional_stop_variants
-            if not variant_has_novel_stop(v, original_stop_signatures)
+        only_original_stop_variants = [
+            v for v in all_variants
+            if v["novel_stop_codon_count"] == 0 and v["missing_expected_terminal_stop_count"] > 0
         ]
 
         if len(all_variants) > 0:
             proportion_variants_with_novel_stops = len(novel_stop_variants) / len(all_variants)
-            proportion_variants_with_only_original_stops = len(nonnovel_stop_variants) / len(all_variants)
+            proportion_variants_with_only_original_stops = len(only_original_stop_variants) / len(all_variants)
         else:
             proportion_variants_with_novel_stops = 0.0
             proportion_variants_with_only_original_stops = 0.0
 
-        if len(additional_stop_variants) > 0:
-            proportion_stop_variants_with_novel_stops = len(novel_stop_variants) / len(additional_stop_variants)
-            proportion_stop_variants_with_only_original_stops = len(nonnovel_stop_variants) / len(additional_stop_variants)
+        stop_issue_variants = [
+            v for v in all_variants
+            if v["novel_stop_codon_count"] > 0 or v["missing_expected_terminal_stop_count"] > 0
+        ]
+
+        if len(stop_issue_variants) > 0:
+            proportion_stop_variants_with_novel_stops = (
+                len([v for v in stop_issue_variants if variant_has_novel_stop(v)]) / len(stop_issue_variants)
+            )
+            proportion_stop_variants_with_only_original_stops = (
+                len([v for v in stop_issue_variants if not variant_has_novel_stop(v)]) / len(stop_issue_variants)
+            )
         else:
             proportion_stop_variants_with_novel_stops = 0.0
             proportion_stop_variants_with_only_original_stops = 0.0
 
-        stop_counter = Counter(v["stop_codon"] for v in additional_stop_variants if v["stop_codon"])
+        stop_counter = Counter(v["stop_codon"] for v in novel_stop_variants if v["stop_codon"])
         taa_count = stop_counter.get("TAA", 0)
         tag_count = stop_counter.get("TAG", 0)
         tga_count = stop_counter.get("TGA", 0)
@@ -766,9 +765,8 @@ def main():
                     "parent_id": f"gen{generation + 1:03d}_parent_{i:03d}",
                     "sequence": variant["sequence"],
                     "total_stop_codon_count": variant["total_stop_codon_count"],
-                    "expected_terminal_stop_count": variant["expected_terminal_stop_count"],
-                    "additional_stop_codon_count": variant["additional_stop_codon_count"],
-                    "terminal_stop_missing_count": variant["terminal_stop_missing_count"],
+                    "novel_stop_codon_count": variant["novel_stop_codon_count"],
+                    "missing_expected_terminal_stop_count": variant["missing_expected_terminal_stop_count"],
                     "is_viable": variant["is_viable"],
                     "stop_codon": variant["stop_codon"],
                     "codon_start_1based": variant["codon_start_1based"],
@@ -795,7 +793,7 @@ def main():
             total_requested_progeny=total_requested_progeny,
             total_realized_variants=len(all_variants),
             structurally_valid_variant_count=len(structurally_valid_variants),
-            additional_stop_variant_count=len(additional_stop_variants),
+            novel_stop_variant_count=len(novel_stop_variants),
             taa_count=taa_count,
             tag_count=tag_count,
             tga_count=tga_count,
