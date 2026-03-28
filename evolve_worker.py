@@ -114,39 +114,25 @@ def mutate_nucleotide(nucleotide: str, mutation_probabilities: dict) -> str:
 
 def analyze_orf_stops(sequence: str, orfs):
     """
-    Analyze stop codons inside ORFs.
+    Analyze all stop codons inside ORFs.
 
-    For each ORF:
-    - the terminal codon is expected to be a stop codon
-    - any stop codon elsewhere in the ORF counts as an additional stop
+    For each in-frame stop codon in each ORF, return a stop record with:
+      stop_codon
+      codon_start_1based
+      codon_index_global_1based
+      first_stop_orf_name
+      codon_index_within_orf_1based
+      is_terminal_orf_stop
 
-    Returns a dictionary with:
-      total_stop_codon_count
-      expected_terminal_stop_count
-      additional_stop_codon_count
-      terminal_stop_missing_count
-      stop_list
-
-    stop_list contains every stop codon found in ORFs and marks whether
-    each one is the terminal ORF stop.
+    Also returns the total number of stop codons found in ORFs.
     """
     stops = []
-    expected_terminal_stop_count = 0
-    terminal_stop_missing_count = 0
 
     for orf in orfs:
         start0 = orf["start_1based"] - 1
         end1 = orf["end_1based"]
         end0_exclusive = end1
-
-        # Terminal codon for this ORF
         terminal_start0 = end1 - 3
-        terminal_codon = sequence[terminal_start0:end1]
-
-        if terminal_codon in STOP_CODONS:
-            expected_terminal_stop_count += 1
-        else:
-            terminal_stop_missing_count += 1
 
         codon_idx_within_orf = 0
         for i in range(start0, end0_exclusive - 2, 3):
@@ -163,19 +149,82 @@ def analyze_orf_stops(sequence: str, orfs):
                     "is_terminal_orf_stop": (i == terminal_start0),
                 })
 
-    total_stop_codon_count = len(stops)
-    additional_stop_codon_count = total_stop_codon_count - expected_terminal_stop_count
-
     return {
-        "total_stop_codon_count": total_stop_codon_count,
-        "expected_terminal_stop_count": expected_terminal_stop_count,
-        "additional_stop_codon_count": additional_stop_codon_count,
-        "terminal_stop_missing_count": terminal_stop_missing_count,
+        "total_stop_codon_count": len(stops),
         "stop_list": stops,
     }
 
 
-def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict, orfs):
+def build_stop_signature_set(stop_list):
+    """
+    Convert a stop list into a set of stop-position signatures:
+      (orf_name, codon_index_within_orf_1based)
+
+    Stop identity is ignored, so any stop codon at the same ORF/codon
+    position is treated as the same expected stop site.
+    """
+    signatures = set()
+    for stop in stop_list:
+        signatures.add((
+            stop["first_stop_orf_name"],
+            stop["codon_index_within_orf_1based"],
+        ))
+    return signatures
+
+
+def build_terminal_stop_signature_set(stop_list):
+    """
+    Convert only terminal ORF stops into a set of terminal stop-position
+    signatures:
+      (orf_name, codon_index_within_orf_1based)
+
+    Stop identity is ignored.
+    """
+    signatures = set()
+    for stop in stop_list:
+        if stop["is_terminal_orf_stop"]:
+            signatures.add((
+                stop["first_stop_orf_name"],
+                stop["codon_index_within_orf_1based"],
+            ))
+    return signatures
+
+
+def summarize_stops_against_expected(sequence: str, orfs,
+                                     expected_stop_signatures,
+                                     expected_terminal_stop_signatures):
+    """
+    Analyze a sequence relative to the expected stop pattern from the start sequence.
+
+    Expected signatures are position-only:
+      (orf_name, codon_index_within_orf_1based)
+
+    Returns:
+      total_stop_codon_count
+      novel_stop_codon_count
+      missing_expected_terminal_stop_count
+      stop_list
+    """
+    stop_info = analyze_orf_stops(sequence, orfs)
+    stop_list = stop_info["stop_list"]
+
+    observed_signatures = build_stop_signature_set(stop_list)
+    novel_signatures = observed_signatures - expected_stop_signatures
+    missing_expected_terminal_signatures = expected_terminal_stop_signatures - observed_signatures
+
+    return {
+        "total_stop_codon_count": stop_info["total_stop_codon_count"],
+        "novel_stop_codon_count": len(novel_signatures),
+        "missing_expected_terminal_stop_count": len(missing_expected_terminal_signatures),
+        "stop_list": stop_list,
+        "observed_signatures": observed_signatures,
+        "novel_signatures": novel_signatures,
+        "missing_expected_terminal_signatures": missing_expected_terminal_signatures,
+    }
+
+
+def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict, orfs,
+                 expected_stop_signatures, expected_terminal_stop_signatures):
     """
     Simulate one descendant sequence from one parent.
 
@@ -183,8 +232,9 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
     - walk through every nucleotide
     - mutate with probability mutation_rate
     - build final mutated sequence
-    - analyze stop codons only inside ORFs
-    - distinguish expected terminal ORF stops from additional stops
+    - analyze stop codons inside ORFs
+    - compare observed stop positions to the expected stop positions
+      from the start sequence
     """
     seq = list(sequence)
 
@@ -193,8 +243,14 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
             seq[i] = mutate_nucleotide(seq[i], mutation_probabilities)
 
     final_seq = "".join(seq)
-    stop_info = analyze_orf_stops(final_seq, orfs)
-    stop_list = stop_info["stop_list"]
+
+    stop_summary = summarize_stops_against_expected(
+        final_seq,
+        orfs,
+        expected_stop_signatures,
+        expected_terminal_stop_signatures
+    )
+    stop_list = stop_summary["stop_list"]
 
     if stop_list:
         first = stop_list[0]
@@ -212,13 +268,12 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
 
     return {
         "sequence": final_seq,
-        "total_stop_codon_count": stop_info["total_stop_codon_count"],
-        "expected_terminal_stop_count": stop_info["expected_terminal_stop_count"],
-        "additional_stop_codon_count": stop_info["additional_stop_codon_count"],
-        "terminal_stop_missing_count": stop_info["terminal_stop_missing_count"],
+        "total_stop_codon_count": stop_summary["total_stop_codon_count"],
+        "novel_stop_codon_count": stop_summary["novel_stop_codon_count"],
+        "missing_expected_terminal_stop_count": stop_summary["missing_expected_terminal_stop_count"],
         "is_viable": (
-            stop_info["terminal_stop_missing_count"] == 0
-            and stop_info["additional_stop_codon_count"] == 0
+            stop_summary["missing_expected_terminal_stop_count"] == 0
+            and stop_summary["novel_stop_codon_count"] == 0
         ),
         "stop_codon": stop_codon,
         "codon_start_1based": codon_start_1based,
@@ -226,7 +281,6 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
         "first_stop_orf_name": first_stop_orf_name,
         "codon_index_within_orf_1based": codon_index_within_orf_1based,
         "mutated_nt_index_1based": "",
-        # internal-use field for classification in run_evolution.py
         "stop_signatures": stop_list,
     }
 
@@ -242,18 +296,37 @@ def simulate_parent_batch(args):
         mutation_rate
         mutation_probabilities
         orfs
+        expected_stop_signatures
+        expected_terminal_stop_signatures
         seed
 
     Returns:
         list of variant dictionaries
     """
-    parent_id, parent_seq, n_sims, mutation_rate, mutation_probabilities, orfs, seed = args
-    random.seed(seed)
+    (
+        parent_id,
+        parent_seq,
+        n_sims,
+        mutation_rate,
+        mutation_probabilities,
+        orfs,
+        expected_stop_signatures,
+        expected_terminal_stop_signatures,
+        seed,
+    ) = args
 
+    random.seed(seed)
     variants = []
 
     for sim_idx in range(1, n_sims + 1):
-        result = simulate_one(parent_seq, mutation_rate, mutation_probabilities, orfs)
+        result = simulate_one(
+            parent_seq,
+            mutation_rate,
+            mutation_probabilities,
+            orfs,
+            expected_stop_signatures,
+            expected_terminal_stop_signatures,
+        )
         result["simulation_index"] = sim_idx
         result["source_parent_id"] = parent_id
         variants.append(result)
