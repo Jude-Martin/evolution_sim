@@ -123,8 +123,6 @@ def analyze_orf_stops(sequence: str, orfs):
       first_stop_orf_name
       codon_index_within_orf_1based
       is_terminal_orf_stop
-
-    Also returns the total number of stop codons found in ORFs.
     """
     stops = []
 
@@ -160,8 +158,7 @@ def build_stop_signature_set(stop_list):
     Convert a stop list into a set of stop-position signatures:
       (orf_name, codon_index_within_orf_1based)
 
-    Stop identity is ignored, so any stop codon at the same ORF/codon
-    position is treated as the same expected stop site.
+    Stop identity is ignored.
     """
     signatures = set()
     for stop in stop_list:
@@ -198,12 +195,6 @@ def summarize_stops_against_expected(sequence: str, orfs,
 
     Expected signatures are position-only:
       (orf_name, codon_index_within_orf_1based)
-
-    Returns:
-      total_stop_codon_count
-      novel_stop_codon_count
-      missing_expected_terminal_stop_count
-      stop_list
     """
     stop_info = analyze_orf_stops(sequence, orfs)
     stop_list = stop_info["stop_list"]
@@ -227,14 +218,6 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
                  expected_stop_signatures, expected_terminal_stop_signatures):
     """
     Simulate one descendant sequence from one parent.
-
-    Process:
-    - walk through every nucleotide
-    - mutate with probability mutation_rate
-    - build final mutated sequence
-    - analyze stop codons inside ORFs
-    - compare observed stop positions to the expected stop positions
-      from the start sequence
     """
     seq = list(sequence)
 
@@ -288,20 +271,6 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
 def simulate_parent_batch(args):
     """
     Simulate many descendants from one parent.
-
-    Arguments:
-        parent_id
-        parent_seq
-        n_sims
-        mutation_rate
-        mutation_probabilities
-        orfs
-        expected_stop_signatures
-        expected_terminal_stop_signatures
-        seed
-
-    Returns:
-        list of variant dictionaries
     """
     (
         parent_id,
