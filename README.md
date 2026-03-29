@@ -29,6 +29,10 @@ python plot_evolution_metrics.py \
 Currently 3 modes can be used for positive selection, exponential_normalized, linear, exponential
 based on scoring of similarity of each parent to reference and scaling by a specified factor
 
+mean_rank is calculated, normalised converted to a weighting factor and used to calculate # of progeny
+	​
+
+
 To check orfs prior to running:
 
 python check_orfs.py   --start-fasta start.fasta --orf-file orfs.tsv  --output-fasta extracted_orfs.fasta
