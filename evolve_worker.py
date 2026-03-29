@@ -158,7 +158,7 @@ def build_stop_signature_set(stop_list):
     Convert a stop list into a set of stop-position signatures:
       (orf_name, codon_index_within_orf_1based)
 
-    Stop identity is ignored.
+    Stop identity is ignored, any stop in position is considered valid.
     """
     signatures = set()
     for stop in stop_list:
