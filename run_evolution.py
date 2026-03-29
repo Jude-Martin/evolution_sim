@@ -112,6 +112,110 @@ def load_config_tsv(path):
     return config
 
 
+def calculate_codon_syn_nonsyn_sites(codon: str):
+    """
+    Calculate synonymous and nonsynonymous sites for a codon.
+
+    synonymous_sites + nonsynonymous_sites = 3
+    """
+    bases = ["A", "C", "G", "T"]
+
+    if codon not in CODON_TO_AA:
+        raise ValueError(f"Unknown codon: {codon}")
+
+    original_aa = CODON_TO_AA[codon]
+    synonymous_sites = 0.0
+    nonsynonymous_sites = 0.0
+
+    for i in range(3):
+        syn_count = 0
+        nonsyn_count = 0
+
+        for b in bases:
+            if b == codon[i]:
+                continue
+
+            mutated_codon = codon[:i] + b + codon[i+1:]
+            mutated_aa = CODON_TO_AA[mutated_codon]
+
+            if mutated_aa == original_aa:
+                syn_count += 1
+            else:
+                nonsyn_count += 1
+
+        synonymous_sites += syn_count / 3.0
+        nonsynonymous_sites += nonsyn_count / 3.0
+
+    return {
+        "codon": codon,
+        "synonymous_sites": synonymous_sites,
+        "nonsynonymous_sites": nonsynonymous_sites,
+    }
+
+
+def build_codon_site_table():
+    """
+    Precompute synonymous/nonsynonymous site values for all codons.
+    """
+    table = {}
+    for codon in CODON_TO_AA:
+        table[codon] = calculate_codon_syn_nonsyn_sites(codon)
+    return table
+
+
+CODON_SITE_TABLE = build_codon_site_table()
+
+
+def calculate_parent_dnds(reference_sequence: str, query_sequence: str, orf_regions):
+    """
+    Calculate dN/dS-style statistics for one parent relative to the start sequence.
+    """
+    synonymous_mutation_count = 0
+    nonsynonymous_mutation_count = 0
+    synonymous_site_count = 0.0
+    nonsynonymous_site_count = 0.0
+
+    for orf in orf_regions:
+        start0 = orf["start_1based"] - 1
+        end0_exclusive = orf["end_1based"]
+
+        for i in range(start0, end0_exclusive, 3):
+            ref_codon = reference_sequence[i:i+3]
+            qry_codon = query_sequence[i:i+3]
+
+            synonymous_site_count += CODON_SITE_TABLE[ref_codon]["synonymous_sites"]
+            nonsynonymous_site_count += CODON_SITE_TABLE[ref_codon]["nonsynonymous_sites"]
+
+            if ref_codon != qry_codon:
+                ref_aa = CODON_TO_AA[ref_codon]
+                qry_aa = CODON_TO_AA[qry_codon]
+
+                if ref_aa == qry_aa:
+                    synonymous_mutation_count += 1
+                else:
+                    nonsynonymous_mutation_count += 1
+
+    pS = synonymous_mutation_count / synonymous_site_count if synonymous_site_count > 0 else 0.0
+    pN = nonsynonymous_mutation_count / nonsynonymous_site_count if nonsynonymous_site_count > 0 else 0.0
+
+    if pS == 0.0 and pN == 0.0:
+        dnds = 0.0
+    elif pS == 0.0 and pN > 0.0:
+        dnds = float("inf")
+    else:
+        dnds = pN / pS
+
+    return {
+        "synonymous_mutation_count": synonymous_mutation_count,
+        "nonsynonymous_mutation_count": nonsynonymous_mutation_count,
+        "synonymous_site_count": synonymous_site_count,
+        "nonsynonymous_site_count": nonsynonymous_site_count,
+        "pS": pS,
+        "pN": pN,
+        "dnds": dnds,
+    }
+
+
 def load_initial_parent(start_fasta: str, orf_regions,
                         expected_stop_signatures,
                         expected_terminal_stop_signatures):
@@ -160,6 +264,13 @@ def load_initial_parent(start_fasta: str, orf_regions,
         "first_stop_orf_name": first_stop_orf_name,
         "codon_index_within_orf_1based": codon_index_within_orf_1based,
         "mutated_nt_index_1based": "",
+        "synonymous_mutation_count": 0,
+        "nonsynonymous_mutation_count": 0,
+        "synonymous_site_count": 0.0,
+        "nonsynonymous_site_count": 0.0,
+        "pS": 0.0,
+        "pN": 0.0,
+        "dnds": 0.0,
         "reference_used": "",
         "similarity_index": "",
         "reproductive_score": ""
@@ -194,6 +305,19 @@ def safe_std(values):
     if len(values) <= 1:
         return 0.0
     return statistics.stdev(values)
+
+
+def safe_mean(values):
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def safe_std_finite(values):
+    finite_values = [v for v in values if math.isfinite(v)]
+    if len(finite_values) <= 1:
+        return 0.0
+    return statistics.stdev(finite_values)
 
 
 def parent_can_reproduce(parent, tolerated_additional_stop_codons: int) -> bool:
@@ -320,11 +444,6 @@ def compute_scalings(ranks, adaptation_scaling, mode):
 
     rank 0 = best parent
     rank N-1 = worst parent
-
-    Modes:
-      linear
-      exponential
-      exponential_normalized
     """
     N = len(ranks)
 
@@ -386,6 +505,13 @@ def write_parent_set(parents, outdir):
             "first_stop_orf_name",
             "codon_index_within_orf_1based",
             "mutated_nt_index_1based",
+            "synonymous_mutation_count",
+            "nonsynonymous_mutation_count",
+            "synonymous_site_count",
+            "nonsynonymous_site_count",
+            "pS",
+            "pN",
+            "dnds",
             "reference_used",
             "similarity_index",
             "reproductive_score",
@@ -414,6 +540,13 @@ def write_parent_set(parents, outdir):
                 parent["first_stop_orf_name"],
                 parent["codon_index_within_orf_1based"],
                 parent["mutated_nt_index_1based"],
+                parent["synonymous_mutation_count"],
+                parent["nonsynonymous_mutation_count"],
+                parent["synonymous_site_count"],
+                parent["nonsynonymous_site_count"],
+                parent["pS"],
+                parent["pN"],
+                parent["dnds"],
                 parent["reference_used"],
                 parent["similarity_index"],
                 parent["reproductive_score"],
@@ -483,6 +616,7 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                               novel_stop_variant_count, taa_count, tag_count, tga_count,
                               mean_similarity_index_ref1, mean_similarity_index_ref2,
                               std_similarity_index_ref1, std_similarity_index_ref2,
+                              mean_dnds_parents, std_dnds_parents,
                               proportion_variants_with_novel_stops,
                               proportion_variants_with_only_original_stops,
                               proportion_stop_variants_with_novel_stops,
@@ -512,6 +646,8 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                 "mean_similarity_index_ref2",
                 "std_similarity_index_ref1",
                 "std_similarity_index_ref2",
+                "mean_dnds_parents",
+                "std_dnds_parents",
                 "proportion_variants_with_novel_stops",
                 "proportion_variants_with_only_original_stops",
                 "proportion_stop_variants_with_novel_stops",
@@ -535,6 +671,8 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
             mean_similarity_index_ref2,
             std_similarity_index_ref1,
             std_similarity_index_ref2,
+            mean_dnds_parents,
+            std_dnds_parents,
             proportion_variants_with_novel_stops,
             proportion_variants_with_only_original_stops,
             proportion_stop_variants_with_novel_stops,
@@ -656,10 +794,7 @@ def main():
 
         parent_scores.sort(key=lambda x: x[1])
 
-        if reference_name == reference1_name:
-            adaptation_scaling = adaptation_scaling_ref1
-        else:
-            adaptation_scaling = adaptation_scaling_ref2
+        adaptation_scaling = adaptation_scaling_ref1 if reference_name == reference1_name else adaptation_scaling_ref2
 
         ranks = list(range(len(parent_scores)))
         scalings = compute_scalings(
@@ -761,6 +896,12 @@ def main():
 
             next_parents = []
             for i, variant in enumerate(sampled_variants):
+                dnds_stats = calculate_parent_dnds(
+                    reference_sequence=original_sequence,
+                    query_sequence=variant["sequence"],
+                    orf_regions=orf_regions
+                )
+
                 next_parents.append({
                     "parent_id": f"gen{generation + 1:03d}_parent_{i:03d}",
                     "sequence": variant["sequence"],
@@ -774,15 +915,28 @@ def main():
                     "first_stop_orf_name": variant["first_stop_orf_name"],
                     "codon_index_within_orf_1based": variant["codon_index_within_orf_1based"],
                     "mutated_nt_index_1based": variant["mutated_nt_index_1based"],
+                    "synonymous_mutation_count": dnds_stats["synonymous_mutation_count"],
+                    "nonsynonymous_mutation_count": dnds_stats["nonsynonymous_mutation_count"],
+                    "synonymous_site_count": dnds_stats["synonymous_site_count"],
+                    "nonsynonymous_site_count": dnds_stats["nonsynonymous_site_count"],
+                    "pS": dnds_stats["pS"],
+                    "pN": dnds_stats["pN"],
+                    "dnds": dnds_stats["dnds"],
                     "reference_used": "",
                     "similarity_index": "",
                     "reproductive_score": ""
                 })
 
+            finite_dnds_values = [p["dnds"] for p in next_parents if math.isfinite(p["dnds"])]
+            mean_dnds_parents = safe_mean(finite_dnds_values)
+            std_dnds_parents = safe_std_finite(finite_dnds_values)
+
             next_parent_dir = os.path.join(args.output_dir, f"gen_{generation + 1:03d}_parents")
             write_parent_set(next_parents, next_parent_dir)
         else:
             next_parents = []
+            mean_dnds_parents = 0.0
+            std_dnds_parents = 0.0
 
         append_generation_summary(
             summary_path=summary_path,
@@ -801,6 +955,8 @@ def main():
             mean_similarity_index_ref2=mean_similarity_index_ref2,
             std_similarity_index_ref1=std_similarity_index_ref1,
             std_similarity_index_ref2=std_similarity_index_ref2,
+            mean_dnds_parents=mean_dnds_parents,
+            std_dnds_parents=std_dnds_parents,
             proportion_variants_with_novel_stops=proportion_variants_with_novel_stops,
             proportion_variants_with_only_original_stops=proportion_variants_with_only_original_stops,
             proportion_stop_variants_with_novel_stops=proportion_stop_variants_with_novel_stops,
