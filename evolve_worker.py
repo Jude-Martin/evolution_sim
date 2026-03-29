@@ -53,11 +53,12 @@ def get_mutation_probabilities(set_id: int):
 
 def load_orf_regions(orffile: str):
     """
-    Load ORFs from a TSV with columns:
+    Load ORFs from a TSV with columns, orfs.tsv
         orf_name    start_1based    end_1based
 
     Coordinates are 1-based inclusive.
     Each ORF length must be divisible by 3.
+    tsv can be checked with check_orfs.py prior to running
     """
     orfs = []
 
