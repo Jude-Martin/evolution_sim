@@ -31,5 +31,5 @@ python run_evolution.py \
   --start-fasta "$START_FASTA" \
   --orf-file "$ORF_FILE" \
   --reference-rscu "$REFERENCE_RSCU" \
-  --penalty-regions "PENALTY_REGIONS" \
+  --penalty-regions "$PENALTY_REGIONS" \
   --output-dir "$OUTDIR"
