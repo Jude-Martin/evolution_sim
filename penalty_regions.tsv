@@ -1,0 +1,6 @@
+region_name	start_1based	end_1based	penalty_factor
+Motif_A	101	120	0.50
+Motif_B	450	480	0.25
+Motif_C	900	960	0.80
+Motif_D	1501	1515	0.10
+Motif_E	2200	2250	0.70
