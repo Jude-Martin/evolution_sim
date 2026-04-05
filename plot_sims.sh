@@ -1,8 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-
+source ~/venvs/evo_sims/bin/activate
 OUTDIR=combined_plots
-#activate venv
 
 python plot_evolution_metrics.py \
   --summary-tsv run1/output/generation_summaries.tsv \
