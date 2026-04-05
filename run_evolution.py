@@ -105,6 +105,70 @@ def load_config_tsv(path):
     return config
 
 
+def load_penalty_regions(path):
+    """
+    Load penalty regions from a TSV with columns:
+      region_name    start_1based    end_1based    penalty_factor
+
+    penalty_factor must be between 0 and 1 inclusive.
+    """
+    regions = []
+
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"region_name", "start_1based", "end_1based", "penalty_factor"}
+        if not required.issubset(reader.fieldnames or set()):
+            raise ValueError(f"Penalty TSV must contain columns: {sorted(required)}")
+
+        for row in reader:
+            start = int(row["start_1based"])
+            end = int(row["end_1based"])
+            penalty = float(row["penalty_factor"])
+
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid penalty region coordinates: {row}")
+            if penalty < 0.0 or penalty > 1.0:
+                raise ValueError(f"Penalty factor must be between 0 and 1: {row}")
+
+            regions.append({
+                "region_name": row["region_name"],
+                "start_1based": start,
+                "end_1based": end,
+                "penalty_factor": penalty,
+            })
+
+    return regions
+
+
+def calculate_region_penalty(reference_sequence, query_sequence, penalty_regions):
+    """
+    Compare query_sequence to reference_sequence over the supplied penalty regions.
+
+    If any mutation is present in a region, apply that region's penalty factor once.
+
+    Penalties combine multiplicatively.
+    """
+    penalty_factor = 1.0
+    mutated_regions = []
+
+    for region in penalty_regions:
+        start0 = region["start_1based"] - 1
+        end0_exclusive = region["end_1based"]
+
+        ref_subseq = reference_sequence[start0:end0_exclusive]
+        qry_subseq = query_sequence[start0:end0_exclusive]
+
+        if ref_subseq != qry_subseq:
+            penalty_factor *= region["penalty_factor"]
+            mutated_regions.append(region["region_name"])
+
+    return {
+        "region_penalty_factor": penalty_factor,
+        "mutated_penalty_region_count": len(mutated_regions),
+        "mutated_penalty_regions": mutated_regions,
+    }
+
+
 def calculate_codon_syn_nonsyn_sites(codon: str):
     """
     Calculate synonymous and nonsynonymous sites for a codon.
@@ -127,7 +191,7 @@ def calculate_codon_syn_nonsyn_sites(codon: str):
             if b == codon[i]:
                 continue
 
-            mutated_codon = codon[:i] + b + codon[i+1:]
+            mutated_codon = codon[:i] + b + codon[i + 1:]
             mutated_aa = CODON_TO_AA[mutated_codon]
 
             if mutated_aa == original_aa:
@@ -169,8 +233,8 @@ def calculate_parent_dnds(reference_sequence: str, query_sequence: str, orf_regi
         end0_exclusive = orf["end_1based"]
 
         for i in range(start0, end0_exclusive, 3):
-            ref_codon = reference_sequence[i:i+3]
-            qry_codon = query_sequence[i:i+3]
+            ref_codon = reference_sequence[i:i + 3]
+            qry_codon = query_sequence[i:i + 3]
 
             synonymous_site_count += CODON_SITE_TABLE[ref_codon]["synonymous_sites"]
             nonsynonymous_site_count += CODON_SITE_TABLE[ref_codon]["nonsynonymous_sites"]
@@ -257,9 +321,13 @@ def load_initial_parent(start_fasta: str, orf_regions, expected_stop_signatures)
         "pS": 0.0,
         "pN": 0.0,
         "dnds": 0.0,
+        "region_penalty_factor": 1.0,
+        "mutated_penalty_region_count": 0,
+        "mutated_penalty_regions": "",
         "reference_used": "",
         "similarity_index": "",
-        "reproductive_score": ""
+        "reproductive_score": "",
+        "effective_reproductive_score": ""
     }]
 
 
@@ -327,7 +395,7 @@ def count_codons_in_sequence(coding_sequence: str):
 
     codon_counts = Counter()
     for i in range(0, len(coding_sequence), 3):
-        codon = coding_sequence[i:i+3]
+        codon = coding_sequence[i:i + 3]
         codon_counts[codon] += 1
     return codon_counts
 
@@ -463,9 +531,13 @@ def write_parent_set(parents, outdir):
             "pS",
             "pN",
             "dnds",
+            "region_penalty_factor",
+            "mutated_penalty_region_count",
+            "mutated_penalty_regions",
             "reference_used",
             "similarity_index",
             "reproductive_score",
+            "effective_reproductive_score",
             "sequence"
         ])
 
@@ -498,9 +570,13 @@ def write_parent_set(parents, outdir):
                 parent["pS"],
                 parent["pN"],
                 parent["dnds"],
+                parent["region_penalty_factor"],
+                parent["mutated_penalty_region_count"],
+                parent["mutated_penalty_regions"],
                 parent["reference_used"],
                 parent["similarity_index"],
                 parent["reproductive_score"],
+                parent["effective_reproductive_score"],
                 parent["sequence"]
             ])
 
@@ -565,6 +641,8 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                               mean_similarity_index_ref1, mean_similarity_index_ref2,
                               std_similarity_index_ref1, std_similarity_index_ref2,
                               mean_dnds_parents, std_dnds_parents,
+                              mean_region_penalty_factor, std_region_penalty_factor,
+                              mean_effective_reproductive_score,
                               proportion_variants_with_novel_stops,
                               proportion_variants_with_only_original_stops,
                               proportion_stop_variants_with_novel_stops,
@@ -593,6 +671,9 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                 "std_similarity_index_ref2",
                 "mean_dnds_parents",
                 "std_dnds_parents",
+                "mean_region_penalty_factor",
+                "std_region_penalty_factor",
+                "mean_effective_reproductive_score",
                 "proportion_variants_with_novel_stops",
                 "proportion_variants_with_only_original_stops",
                 "proportion_stop_variants_with_novel_stops",
@@ -618,6 +699,9 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
             std_similarity_index_ref2,
             mean_dnds_parents,
             std_dnds_parents,
+            mean_region_penalty_factor,
+            std_region_penalty_factor,
+            mean_effective_reproductive_score,
             proportion_variants_with_novel_stops,
             proportion_variants_with_only_original_stops,
             proportion_stop_variants_with_novel_stops,
@@ -634,6 +718,7 @@ def main():
     parser.add_argument("--orf-file", required=True)
     parser.add_argument("--reference-rscu", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--penalty-regions", default=None)
 
     args = parser.parse_args()
 
@@ -641,6 +726,7 @@ def main():
     orf_regions = load_orf_regions(args.orf_file)
     mutation_probabilities = get_mutation_probabilities(int(cfg["mutation_set"]))
     reference_vectors = load_reference_rscu_tsv(args.reference_rscu)
+    penalty_regions = load_penalty_regions(args.penalty_regions) if args.penalty_regions else []
 
     mutation_rate = float(cfg["mutation_rate"])
     num_generations = int(cfg["num_generations"])
@@ -746,9 +832,19 @@ def main():
 
         progeny_counts = []
         for (parent, dist), scaling in zip(parent_scores, scalings):
-            parent["reproductive_score"] = scaling
+            if "region_penalty_factor" not in parent or parent["region_penalty_factor"] == "":
+                parent["region_penalty_factor"] = 1.0
+            if "mutated_penalty_region_count" not in parent or parent["mutated_penalty_region_count"] == "":
+                parent["mutated_penalty_region_count"] = 0
+            if "mutated_penalty_regions" not in parent or parent["mutated_penalty_regions"] == "":
+                parent["mutated_penalty_regions"] = ""
 
-            progeny = int(round(progeny_scale * scaling))
+            effective_weight = scaling * parent["region_penalty_factor"]
+
+            parent["reproductive_score"] = scaling
+            parent["effective_reproductive_score"] = effective_weight
+
+            progeny = int(round(progeny_scale * effective_weight))
             progeny = min(progeny, max_progeny_per_parent)
 
             progeny_counts.append((parent, progeny))
@@ -842,6 +938,12 @@ def main():
                     orf_regions=orf_regions
                 )
 
+                penalty_stats = calculate_region_penalty(
+                    reference_sequence=original_sequence,
+                    query_sequence=variant["sequence"],
+                    penalty_regions=penalty_regions
+                )
+
                 next_parents.append({
                     "parent_id": f"gen{generation + 1:03d}_parent_{i:03d}",
                     "sequence": variant["sequence"],
@@ -862,14 +964,22 @@ def main():
                     "pS": dnds_stats["pS"],
                     "pN": dnds_stats["pN"],
                     "dnds": dnds_stats["dnds"],
+                    "region_penalty_factor": penalty_stats["region_penalty_factor"],
+                    "mutated_penalty_region_count": penalty_stats["mutated_penalty_region_count"],
+                    "mutated_penalty_regions": ",".join(penalty_stats["mutated_penalty_regions"]),
                     "reference_used": "",
                     "similarity_index": "",
-                    "reproductive_score": ""
+                    "reproductive_score": "",
+                    "effective_reproductive_score": ""
                 })
 
             finite_dnds_values = [p["dnds"] for p in next_parents if math.isfinite(p["dnds"])]
             mean_dnds_parents = safe_mean(finite_dnds_values)
             std_dnds_parents = safe_std_finite(finite_dnds_values)
+
+            penalty_values = [p["region_penalty_factor"] for p in next_parents]
+            mean_region_penalty_factor = safe_mean(penalty_values)
+            std_region_penalty_factor = safe_std(penalty_values) if len(penalty_values) > 1 else 0.0
 
             next_parent_dir = os.path.join(args.output_dir, f"gen_{generation + 1:03d}_parents")
             write_parent_set(next_parents, next_parent_dir)
@@ -877,6 +987,15 @@ def main():
             next_parents = []
             mean_dnds_parents = 0.0
             std_dnds_parents = 0.0
+            mean_region_penalty_factor = 0.0
+            std_region_penalty_factor = 0.0
+
+        effective_scores = [
+            p["effective_reproductive_score"]
+            for p in reproductive_parents
+            if p.get("effective_reproductive_score", "") != ""
+        ]
+        mean_effective_reproductive_score = safe_mean(effective_scores) if effective_scores else 0.0
 
         append_generation_summary(
             summary_path=summary_path,
@@ -897,6 +1016,9 @@ def main():
             std_similarity_index_ref2=std_similarity_index_ref2,
             mean_dnds_parents=mean_dnds_parents,
             std_dnds_parents=std_dnds_parents,
+            mean_region_penalty_factor=mean_region_penalty_factor,
+            std_region_penalty_factor=std_region_penalty_factor,
+            mean_effective_reproductive_score=mean_effective_reproductive_score,
             proportion_variants_with_novel_stops=proportion_variants_with_novel_stops,
             proportion_variants_with_only_original_stops=proportion_variants_with_only_original_stops,
             proportion_stop_variants_with_novel_stops=proportion_stop_variants_with_novel_stops,
