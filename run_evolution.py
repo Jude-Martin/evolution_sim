@@ -14,42 +14,39 @@ from Bio.SeqRecord import SeqRecord
 from evolve_worker import (
     analyze_orf_stops,
     build_stop_signature_set,
-    build_terminal_stop_signature_set,
     get_mutation_probabilities,
     load_orf_regions,
     simulate_parent_batch,
     summarize_stops_against_expected,
 )
 
-# User-specified amino acid order
 AA_ORDER = (
     "A", "R", "N", "D", "C", "Q", "E", "G", "H", "I",
     "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V", "Stop"
 )
 
-# User-specified codon grouping and ordering
 CODON_GROUPS_ORDERED = [
-    ["GCT", "GCC", "GCA", "GCG"],                         # A
-    ["CGT", "CGC", "CGA", "CGG", "AGA", "AGG"],          # R
-    ["AAT", "AAC"],                                       # N
-    ["GAT", "GAC"],                                       # D
-    ["TGT", "TGC"],                                       # C
-    ["CAA", "CAG"],                                       # Q
-    ["GAA", "GAG"],                                       # E
-    ["GGT", "GGC", "GGA", "GGG"],                         # G
-    ["CAT", "CAC"],                                       # H
-    ["ATT", "ATC", "ATA"],                                # I
-    ["CTT", "CTC", "CTA", "CTG", "TTA", "TTG"],          # L
-    ["AAA", "AAG"],                                       # K
-    ["ATG"],                                              # M
-    ["TTT", "TTC"],                                       # F
-    ["CCT", "CCC", "CCA", "CCG"],                         # P
-    ["TCA", "TCC", "TCT", "TCG", "AGT", "AGC"],          # S
-    ["ACA", "ACT", "ACG", "ACC"],                         # T
-    ["TGG"],                                              # W
-    ["TAC", "TAT"],                                       # Y
-    ["GTA", "GTC", "GTT", "GTG"],                         # V
-    ["TGA", "TAG", "TAA"]                                 # Stop
+    ["GCT", "GCC", "GCA", "GCG"],
+    ["CGT", "CGC", "CGA", "CGG", "AGA", "AGG"],
+    ["AAT", "AAC"],
+    ["GAT", "GAC"],
+    ["TGT", "TGC"],
+    ["CAA", "CAG"],
+    ["GAA", "GAG"],
+    ["GGT", "GGC", "GGA", "GGG"],
+    ["CAT", "CAC"],
+    ["ATT", "ATC", "ATA"],
+    ["CTT", "CTC", "CTA", "CTG", "TTA", "TTG"],
+    ["AAA", "AAG"],
+    ["ATG"],
+    ["TTT", "TTC"],
+    ["CCT", "CCC", "CCA", "CCG"],
+    ["TCA", "TCC", "TCT", "TCG", "AGT", "AGC"],
+    ["ACA", "ACT", "ACG", "ACC"],
+    ["TGG"],
+    ["TAC", "TAT"],
+    ["GTA", "GTC", "GTT", "GTG"],
+    ["TGA", "TAG", "TAA"]
 ]
 
 AA_TO_CODONS = {
@@ -83,10 +80,6 @@ SENSE_CODON_ORDER = [
 
 
 def load_config_tsv(path):
-    """
-    Load a simple key-value TSV with columns:
-        parameter   value
-    """
     config = {}
 
     with open(path, "r", newline="") as f:
@@ -115,7 +108,6 @@ def load_config_tsv(path):
 def calculate_codon_syn_nonsyn_sites(codon: str):
     """
     Calculate synonymous and nonsynonymous sites for a codon.
-
     synonymous_sites + nonsynonymous_sites = 3
     """
     bases = ["A", "C", "G", "T"]
@@ -154,9 +146,6 @@ def calculate_codon_syn_nonsyn_sites(codon: str):
 
 
 def build_codon_site_table():
-    """
-    Precompute synonymous/nonsynonymous site values for all codons.
-    """
     table = {}
     for codon in CODON_TO_AA:
         table[codon] = calculate_codon_syn_nonsyn_sites(codon)
@@ -216,9 +205,7 @@ def calculate_parent_dnds(reference_sequence: str, query_sequence: str, orf_regi
     }
 
 
-def load_initial_parent(start_fasta: str, orf_regions,
-                        expected_stop_signatures,
-                        expected_terminal_stop_signatures):
+def load_initial_parent(start_fasta: str, orf_regions, expected_stop_signatures):
     """
     Load the initial sequence from FASTA and analyze it using the same
     expected-stop logic as simulated variants.
@@ -229,8 +216,7 @@ def load_initial_parent(start_fasta: str, orf_regions,
     stop_summary = summarize_stops_against_expected(
         sequence,
         orf_regions,
-        expected_stop_signatures,
-        expected_terminal_stop_signatures
+        expected_stop_signatures
     )
     stop_list = stop_summary["stop_list"]
 
@@ -253,9 +239,9 @@ def load_initial_parent(start_fasta: str, orf_regions,
         "sequence": sequence,
         "total_stop_codon_count": stop_summary["total_stop_codon_count"],
         "novel_stop_codon_count": stop_summary["novel_stop_codon_count"],
-        "missing_expected_terminal_stop_count": stop_summary["missing_expected_terminal_stop_count"],
+        "missing_expected_stop_count": stop_summary["missing_expected_stop_count"],
         "is_viable": (
-            stop_summary["missing_expected_terminal_stop_count"] == 0
+            stop_summary["missing_expected_stop_count"] == 0
             and stop_summary["novel_stop_codon_count"] == 0
         ),
         "stop_codon": stop_codon,
@@ -277,27 +263,21 @@ def load_initial_parent(start_fasta: str, orf_regions,
     }]
 
 
-def get_original_stop_sets(start_fasta: str, orf_regions):
+def get_original_stop_set(start_fasta: str, orf_regions):
     """
-    Read the start sequence and derive:
-    - expected_stop_signatures: all stop positions present in ORFs at the start
-    - expected_terminal_stop_signatures: subset of those that are terminal ORF stop positions
+    Read the start sequence and derive the expected stop-position set:
+    all stop positions present in ORFs at the start.
     """
     record = next(SeqIO.parse(start_fasta, "fasta"))
     sequence = str(record.seq)
 
     stop_info = analyze_orf_stops(sequence, orf_regions)
     expected_stop_signatures = build_stop_signature_set(stop_info["stop_list"])
-    expected_terminal_stop_signatures = build_terminal_stop_signature_set(stop_info["stop_list"])
 
-    return sequence, expected_stop_signatures, expected_terminal_stop_signatures
+    return sequence, expected_stop_signatures
 
 
 def variant_has_novel_stop(variant):
-    """
-    True if the variant contains at least one novel stop position
-    relative to the start sequence.
-    """
     return variant["novel_stop_codon_count"] > 0
 
 
@@ -323,19 +303,16 @@ def safe_std_finite(values):
 def parent_can_reproduce(parent, tolerated_additional_stop_codons: int) -> bool:
     """
     Parent can reproduce only if:
-    - all expected terminal stop positions are still occupied by a stop codon
+    - all expected stop positions from the start sequence are still present
     - novel stop-position count is within tolerance
     """
     return (
-        parent["missing_expected_terminal_stop_count"] == 0
+        parent["missing_expected_stop_count"] == 0
         and parent["novel_stop_codon_count"] <= tolerated_additional_stop_codons
     )
 
 
 def extract_concatenated_orf_sequence(sequence: str, orf_regions):
-    """
-    Extract ORFs from the sequence and concatenate them in ORF-file order.
-    """
     parts = []
     for orf in orf_regions:
         start0 = orf["start_1based"] - 1
@@ -345,9 +322,6 @@ def extract_concatenated_orf_sequence(sequence: str, orf_regions):
 
 
 def count_codons_in_sequence(coding_sequence: str):
-    """
-    Count codons in a coding sequence whose length must be divisible by 3.
-    """
     if len(coding_sequence) % 3 != 0:
         raise ValueError("Concatenated ORF sequence length is not divisible by 3.")
 
@@ -359,10 +333,6 @@ def count_codons_in_sequence(coding_sequence: str):
 
 
 def compute_rscu_vector(sequence: str, orf_regions):
-    """
-    Compute an RSCU vector in the fixed codon order requested by the user.
-    Stop codons are excluded from the RSCU vector.
-    """
     coding_sequence = extract_concatenated_orf_sequence(sequence, orf_regions)
     codon_counts = count_codons_in_sequence(coding_sequence)
 
@@ -384,10 +354,6 @@ def compute_rscu_vector(sequence: str, orf_regions):
 
 
 def cosine_distance(vec1, vec2):
-    """
-    Cosine distance is the Similarity Index in this project.
-    Lower = more similar.
-    """
     if len(vec1) != len(vec2):
         raise ValueError("Vectors must be same length.")
 
@@ -403,9 +369,6 @@ def cosine_distance(vec1, vec2):
 
 
 def load_reference_rscu_tsv(reference_tsv: str):
-    """
-    Load reference RSCU vectors from a TSV.
-    """
     references = {}
 
     with open(reference_tsv, "r", newline="") as handle:
@@ -428,9 +391,6 @@ def load_reference_rscu_tsv(reference_tsv: str):
 
 
 def get_reference_name_for_generation(generation: int, cycle_n: int, ref1_name: str, ref2_name: str):
-    """
-    Determine which reference is active for a generation.
-    """
     cycle_len = cycle_n + 1
     pos = (generation - 1) % cycle_len
     if pos < cycle_n:
@@ -439,12 +399,6 @@ def get_reference_name_for_generation(generation: int, cycle_n: int, ref1_name: 
 
 
 def compute_scalings(ranks, adaptation_scaling, mode):
-    """
-    Convert parent ranks into scaling factors.
-
-    rank 0 = best parent
-    rank N-1 = worst parent
-    """
     N = len(ranks)
 
     if N <= 1:
@@ -483,9 +437,6 @@ def compute_scalings(ranks, adaptation_scaling, mode):
 
 
 def write_parent_set(parents, outdir):
-    """
-    Write the sampled parent set for a generation.
-    """
     os.makedirs(outdir, exist_ok=True)
 
     manifest_path = os.path.join(outdir, "parents_manifest.txt")
@@ -497,7 +448,7 @@ def write_parent_set(parents, outdir):
             "parent_id",
             "total_stop_codon_count",
             "novel_stop_codon_count",
-            "missing_expected_terminal_stop_count",
+            "missing_expected_stop_count",
             "is_viable",
             "stop_codon",
             "codon_start_1based",
@@ -532,7 +483,7 @@ def write_parent_set(parents, outdir):
                 parent["parent_id"],
                 parent["total_stop_codon_count"],
                 parent["novel_stop_codon_count"],
-                parent["missing_expected_terminal_stop_count"],
+                parent["missing_expected_stop_count"],
                 int(parent["is_viable"]),
                 parent["stop_codon"],
                 parent["codon_start_1based"],
@@ -555,9 +506,6 @@ def write_parent_set(parents, outdir):
 
 
 def write_checkpoint_record(record_dir, generation, variants):
-    """
-    Write full checkpoint outputs for selected generations.
-    """
     os.makedirs(record_dir, exist_ok=True)
 
     viable_fasta = os.path.join(record_dir, f"gen_{generation:03d}_viable_variants.fasta")
@@ -571,7 +519,7 @@ def write_checkpoint_record(record_dir, generation, variants):
             "source_parent_id",
             "total_stop_codon_count",
             "novel_stop_codon_count",
-            "missing_expected_terminal_stop_count",
+            "missing_expected_stop_count",
             "is_viable",
             "stop_codon",
             "codon_start_1based",
@@ -591,7 +539,7 @@ def write_checkpoint_record(record_dir, generation, variants):
                 variant["source_parent_id"],
                 variant["total_stop_codon_count"],
                 variant["novel_stop_codon_count"],
-                variant["missing_expected_terminal_stop_count"],
+                variant["missing_expected_stop_count"],
                 int(variant["is_viable"]),
                 variant["stop_codon"],
                 variant["codon_start_1based"],
@@ -602,7 +550,7 @@ def write_checkpoint_record(record_dir, generation, variants):
                 variant["sequence"]
             ])
 
-            if variant["missing_expected_terminal_stop_count"] == 0 and variant["novel_stop_codon_count"] == 0:
+            if variant["missing_expected_stop_count"] == 0 and variant["novel_stop_codon_count"] == 0:
                 viable_out.write(f">gen{generation:03d}_viable_{viable_i}\n{variant['sequence']}\n")
                 viable_i += 1
             else:
@@ -622,9 +570,6 @@ def append_generation_summary(summary_path, generation, reference_used, sampled_
                               proportion_stop_variants_with_novel_stops,
                               proportion_stop_variants_with_only_original_stops,
                               checkpoint_written):
-    """
-    Append one row of summary metrics for the current generation.
-    """
     write_header = not os.path.exists(summary_path)
 
     with open(summary_path, "a", newline="") as out:
@@ -724,16 +669,12 @@ def main():
     rng = random.Random(seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Derive expected stop-position pattern from the start sequence itself
-    original_sequence, expected_stop_signatures, expected_terminal_stop_signatures = (
-        get_original_stop_sets(args.start_fasta, orf_regions)
-    )
+    original_sequence, expected_stop_signatures = get_original_stop_set(args.start_fasta, orf_regions)
 
     current_parents = load_initial_parent(
         args.start_fasta,
         orf_regions,
-        expected_stop_signatures,
-        expected_terminal_stop_signatures
+        expected_stop_signatures
     )
 
     write_parent_set(current_parents, os.path.join(args.output_dir, "gen_001_parents"))
@@ -832,7 +773,6 @@ def main():
                 mutation_probabilities,
                 orf_regions,
                 expected_stop_signatures,
-                expected_terminal_stop_signatures,
                 seed + generation * 100000 + parent_idx
             ))
 
@@ -846,7 +786,7 @@ def main():
 
         structurally_valid_variants = [
             v for v in all_variants
-            if v["missing_expected_terminal_stop_count"] == 0 and v["novel_stop_codon_count"] == 0
+            if v["missing_expected_stop_count"] == 0 and v["novel_stop_codon_count"] == 0
         ]
         novel_stop_variants = [
             v for v in all_variants
@@ -854,7 +794,7 @@ def main():
         ]
         only_original_stop_variants = [
             v for v in all_variants
-            if v["novel_stop_codon_count"] == 0 and v["missing_expected_terminal_stop_count"] > 0
+            if v["novel_stop_codon_count"] == 0 and v["missing_expected_stop_count"] > 0
         ]
 
         if len(all_variants) > 0:
@@ -866,7 +806,7 @@ def main():
 
         stop_issue_variants = [
             v for v in all_variants
-            if v["novel_stop_codon_count"] > 0 or v["missing_expected_terminal_stop_count"] > 0
+            if v["novel_stop_codon_count"] > 0 or v["missing_expected_stop_count"] > 0
         ]
 
         if len(stop_issue_variants) > 0:
@@ -907,7 +847,7 @@ def main():
                     "sequence": variant["sequence"],
                     "total_stop_codon_count": variant["total_stop_codon_count"],
                     "novel_stop_codon_count": variant["novel_stop_codon_count"],
-                    "missing_expected_terminal_stop_count": variant["missing_expected_terminal_stop_count"],
+                    "missing_expected_stop_count": variant["missing_expected_stop_count"],
                     "is_viable": variant["is_viable"],
                     "stop_codon": variant["stop_codon"],
                     "codon_start_1based": variant["codon_start_1based"],
