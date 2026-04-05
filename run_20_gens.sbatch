@@ -23,7 +23,7 @@ OUTDIR=${OUTDIR:?need OUTDIR}
 mkdir -p "$OUTDIR" logs
 
 # Activate Python environment here if needed
-# source ~/venvs/evolution_env/bin/activate
+source ~/venvs/evo_sims/bin/activate
 
 python run_evolution.py \
   --config-tsv "$CONFIG_TSV" \
