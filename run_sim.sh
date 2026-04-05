@@ -1,4 +1,6 @@
-bash
+#!/bin/bash
+set -euo pipefail
+source ~/venvs/evo_sims/bin/activate
 
 
 python run_evolution.py \
