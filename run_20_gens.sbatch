@@ -18,6 +18,7 @@ START_FASTA=${START_FASTA:?need START_FASTA}
 ORF_FILE=${ORF_FILE:?need ORF_FILE}
 REFERENCE_RSCU=${REFERENCE_RSCU:?need REFERENCE_RSCU}
 CONFIG_TSV=${CONFIG_TSV:?need CONFIG_TSV}
+PENALTY_REGIONS=${PENALTY_REGIONS:?need PENALTY_REGIONS}
 OUTDIR=${OUTDIR:?need OUTDIR}
 
 mkdir -p "$OUTDIR" logs
@@ -30,4 +31,5 @@ python run_evolution.py \
   --start-fasta "$START_FASTA" \
   --orf-file "$ORF_FILE" \
   --reference-rscu "$REFERENCE_RSCU" \
+  --penalty-regions "PENALTY_REGIONS" \
   --output-dir "$OUTDIR"
