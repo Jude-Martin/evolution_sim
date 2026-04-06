@@ -1,35 +1,1102 @@
-#!/bin/bash
-#SBATCH --job-name=evolve20
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
-#SBATCH --mem=20G
-#SBATCH --time=24:00:00
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+import argparse
+import csv
+import math
+import os
+import random
+import statistics
+from collections import Counter
+from multiprocessing import Pool
 
-# Safer bash behavior:
-# -e        stop on command failure
-# -u        stop on undefined variables
-# pipefail  fail if any command in a pipeline fails
-set -euo pipefail
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
-# Required inputs
-START_FASTA=${START_FASTA:?need START_FASTA}
-ORF_FILE=${ORF_FILE:?need ORF_FILE}
-REFERENCE_RSCU=${REFERENCE_RSCU:?need REFERENCE_RSCU}
-CONFIG_TSV=${CONFIG_TSV:?need CONFIG_TSV}
-PENALTY_REGIONS=${PENALTY_REGIONS:?need PENALTY_REGIONS}
-OUTDIR=${OUTDIR:?need OUTDIR}
+from evolve_worker import (
+    analyze_orf_stops,
+    build_stop_signature_set,
+    get_mutation_probabilities,
+    load_orf_regions,
+    simulate_parent_batch,
+    summarize_stops_against_expected,
+)
 
-mkdir -p "$OUTDIR" logs
+AA_ORDER = (
+    "A", "R", "N", "D", "C", "Q", "E", "G", "H", "I",
+    "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V", "Stop"
+)
 
-# Activate Python environment here if needed
-source ~/venvs/evo_sims/bin/activate
+CODON_GROUPS_ORDERED = [
+    ["GCT", "GCC", "GCA", "GCG"],
+    ["CGT", "CGC", "CGA", "CGG", "AGA", "AGG"],
+    ["AAT", "AAC"],
+    ["GAT", "GAC"],
+    ["TGT", "TGC"],
+    ["CAA", "CAG"],
+    ["GAA", "GAG"],
+    ["GGT", "GGC", "GGA", "GGG"],
+    ["CAT", "CAC"],
+    ["ATT", "ATC", "ATA"],
+    ["CTT", "CTC", "CTA", "CTG", "TTA", "TTG"],
+    ["AAA", "AAG"],
+    ["ATG"],
+    ["TTT", "TTC"],
+    ["CCT", "CCC", "CCA", "CCG"],
+    ["TCA", "TCC", "TCT", "TCG", "AGT", "AGC"],
+    ["ACA", "ACT", "ACG", "ACC"],
+    ["TGG"],
+    ["TAC", "TAT"],
+    ["GTA", "GTC", "GTT", "GTG"],
+    ["TGA", "TAG", "TAA"]
+]
 
-python run_evolution.py \
-  --config-tsv "$CONFIG_TSV" \
-  --start-fasta "$START_FASTA" \
-  --orf-file "$ORF_FILE" \
-  --reference-rscu "$REFERENCE_RSCU" \
-  --penalty-regions "PENALTY_REGIONS" \
-  --output-dir "$OUTDIR"
+AA_TO_CODONS = {
+    aa: codons
+    for aa, codons in zip(AA_ORDER, CODON_GROUPS_ORDERED)
+}
+
+CODON_TO_AA = {}
+for aa, codons in AA_TO_CODONS.items():
+    for codon in codons:
+        CODON_TO_AA[codon] = aa
+
+CODON_ORDER = [
+    codon
+    for group in CODON_GROUPS_ORDERED
+    for codon in group
+]
+
+SENSE_AA_TO_CODONS = {
+    aa: codons
+    for aa, codons in AA_TO_CODONS.items()
+    if aa != "Stop"
+}
+
+SENSE_CODON_ORDER = [
+    codon
+    for aa in AA_ORDER
+    if aa != "Stop"
+    for codon in AA_TO_CODONS[aa]
+]
+
+
+def load_config_tsv(path):
+    config = {}
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        required = {"parameter", "value"}
+        if not required.issubset(reader.fieldnames or set()):
+            raise ValueError(f"Config TSV must contain columns: {sorted(required)}")
+
+        for row in reader:
+            key = row["parameter"]
+            value = row["value"]
+
+            if value.isdigit():
+                value = int(value)
+            else:
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+
+            config[key] = value
+
+    return config
+
+
+def load_penalty_regions(path):
+    """
+    Load penalty regions from a TSV with columns:
+      region_name    start_1based    end_1based    penalty_factor
+
+    penalty_factor must be between 0 and 1 inclusive.
+    """
+    regions = []
+
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"region_name", "start_1based", "end_1based", "penalty_factor"}
+        if not required.issubset(reader.fieldnames or set()):
+            raise ValueError(f"Penalty TSV must contain columns: {sorted(required)}")
+
+        for row in reader:
+            start = int(row["start_1based"])
+            end = int(row["end_1based"])
+            penalty = float(row["penalty_factor"])
+
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid penalty region coordinates: {row}")
+            if penalty < 0.0 or penalty > 1.0:
+                raise ValueError(f"Penalty factor must be between 0 and 1: {row}")
+
+            regions.append({
+                "region_name": row["region_name"],
+                "start_1based": start,
+                "end_1based": end,
+                "penalty_factor": penalty,
+            })
+
+    return regions
+
+
+def calculate_region_penalty(reference_sequence, query_sequence, penalty_regions):
+    """
+    Compare query_sequence to reference_sequence over the supplied penalty regions.
+
+    If any mutation is present in a region, apply that region's penalty factor once.
+
+    Penalties combine multiplicatively.
+    """
+    penalty_factor = 1.0
+    mutated_regions = []
+
+    for region in penalty_regions:
+        start0 = region["start_1based"] - 1
+        end0_exclusive = region["end_1based"]
+
+        ref_subseq = reference_sequence[start0:end0_exclusive]
+        qry_subseq = query_sequence[start0:end0_exclusive]
+
+        if ref_subseq != qry_subseq:
+            penalty_factor *= region["penalty_factor"]
+            mutated_regions.append(region["region_name"])
+
+    return {
+        "region_penalty_factor": penalty_factor,
+        "mutated_penalty_region_count": len(mutated_regions),
+        "mutated_penalty_regions": mutated_regions,
+    }
+
+
+def calculate_codon_syn_nonsyn_sites(codon: str):
+    """
+    Calculate synonymous and nonsynonymous sites for a codon.
+    synonymous_sites + nonsynonymous_sites = 3
+    """
+    bases = ["A", "C", "G", "T"]
+
+    if codon not in CODON_TO_AA:
+        raise ValueError(f"Unknown codon: {codon}")
+
+    original_aa = CODON_TO_AA[codon]
+    synonymous_sites = 0.0
+    nonsynonymous_sites = 0.0
+
+    for i in range(3):
+        syn_count = 0
+        nonsyn_count = 0
+
+        for b in bases:
+            if b == codon[i]:
+                continue
+
+            mutated_codon = codon[:i] + b + codon[i + 1:]
+            mutated_aa = CODON_TO_AA[mutated_codon]
+
+            if mutated_aa == original_aa:
+                syn_count += 1
+            else:
+                nonsyn_count += 1
+
+        synonymous_sites += syn_count / 3.0
+        nonsynonymous_sites += nonsyn_count / 3.0
+
+    return {
+        "codon": codon,
+        "synonymous_sites": synonymous_sites,
+        "nonsynonymous_sites": nonsynonymous_sites,
+    }
+
+
+def build_codon_site_table():
+    table = {}
+    for codon in CODON_TO_AA:
+        table[codon] = calculate_codon_syn_nonsyn_sites(codon)
+    return table
+
+
+CODON_SITE_TABLE = build_codon_site_table()
+
+
+def calculate_parent_dnds(reference_sequence: str, query_sequence: str, orf_regions):
+    """
+    Calculate dN/dS-style statistics for one parent relative to the start sequence.
+    """
+    synonymous_mutation_count = 0
+    nonsynonymous_mutation_count = 0
+    synonymous_site_count = 0.0
+    nonsynonymous_site_count = 0.0
+
+    for orf in orf_regions:
+        start0 = orf["start_1based"] - 1
+        end0_exclusive = orf["end_1based"]
+
+        for i in range(start0, end0_exclusive, 3):
+            ref_codon = reference_sequence[i:i + 3]
+            qry_codon = query_sequence[i:i + 3]
+
+            synonymous_site_count += CODON_SITE_TABLE[ref_codon]["synonymous_sites"]
+            nonsynonymous_site_count += CODON_SITE_TABLE[ref_codon]["nonsynonymous_sites"]
+
+            if ref_codon != qry_codon:
+                ref_aa = CODON_TO_AA[ref_codon]
+                qry_aa = CODON_TO_AA[qry_codon]
+
+                if ref_aa == qry_aa:
+                    synonymous_mutation_count += 1
+                else:
+                    nonsynonymous_mutation_count += 1
+
+    pS = synonymous_mutation_count / synonymous_site_count if synonymous_site_count > 0 else 0.0
+    pN = nonsynonymous_mutation_count / nonsynonymous_site_count if nonsynonymous_site_count > 0 else 0.0
+
+    if pS == 0.0 and pN == 0.0:
+        dnds = 0.0
+    elif pS == 0.0 and pN > 0.0:
+        dnds = float("inf")
+    else:
+        dnds = pN / pS
+
+    return {
+        "synonymous_mutation_count": synonymous_mutation_count,
+        "nonsynonymous_mutation_count": nonsynonymous_mutation_count,
+        "synonymous_site_count": synonymous_site_count,
+        "nonsynonymous_site_count": nonsynonymous_site_count,
+        "pS": pS,
+        "pN": pN,
+        "dnds": dnds,
+    }
+
+
+def load_initial_parent(start_fasta: str, orf_regions, expected_stop_signatures):
+    """
+    Load the initial sequence from FASTA and analyze it using the same
+    expected-stop logic as simulated variants.
+    """
+    record = next(SeqIO.parse(start_fasta, "fasta"))
+    sequence = str(record.seq)
+
+    stop_summary = summarize_stops_against_expected(
+        sequence,
+        orf_regions,
+        expected_stop_signatures
+    )
+    stop_list = stop_summary["stop_list"]
+
+    if stop_list:
+        first = stop_list[0]
+        stop_codon = first["stop_codon"]
+        codon_start_1based = first["codon_start_1based"]
+        codon_index_global_1based = first["codon_index_global_1based"]
+        first_stop_orf_name = first["first_stop_orf_name"]
+        codon_index_within_orf_1based = first["codon_index_within_orf_1based"]
+    else:
+        stop_codon = ""
+        codon_start_1based = ""
+        codon_index_global_1based = ""
+        first_stop_orf_name = ""
+        codon_index_within_orf_1based = ""
+
+    return [{
+        "parent_id": record.id,
+        "sequence": sequence,
+        "total_stop_codon_count": stop_summary["total_stop_codon_count"],
+        "novel_stop_codon_count": stop_summary["novel_stop_codon_count"],
+        "missing_expected_stop_count": stop_summary["missing_expected_stop_count"],
+        "is_viable": (
+            stop_summary["missing_expected_stop_count"] == 0
+            and stop_summary["novel_stop_codon_count"] == 0
+        ),
+        "stop_codon": stop_codon,
+        "codon_start_1based": codon_start_1based,
+        "codon_index_global_1based": codon_index_global_1based,
+        "first_stop_orf_name": first_stop_orf_name,
+        "codon_index_within_orf_1based": codon_index_within_orf_1based,
+        "mutated_nt_index_1based": "",
+        "synonymous_mutation_count": 0,
+        "nonsynonymous_mutation_count": 0,
+        "synonymous_site_count": 0.0,
+        "nonsynonymous_site_count": 0.0,
+        "pS": 0.0,
+        "pN": 0.0,
+        "dnds": 0.0,
+        "region_penalty_factor": 1.0,
+        "mutated_penalty_region_count": 0,
+        "mutated_penalty_regions": "",
+        "reference_used": "",
+        "similarity_index": "",
+        "reproductive_score": "",
+        "effective_reproductive_score": ""
+    }]
+
+
+def get_original_stop_set(start_fasta: str, orf_regions):
+    """
+    Read the start sequence and derive the expected stop-position set:
+    all stop positions present in ORFs at the start.
+    """
+    record = next(SeqIO.parse(start_fasta, "fasta"))
+    sequence = str(record.seq)
+
+    stop_info = analyze_orf_stops(sequence, orf_regions)
+    expected_stop_signatures = build_stop_signature_set(stop_info["stop_list"])
+
+    return sequence, expected_stop_signatures
+
+
+def variant_has_novel_stop(variant):
+    return variant["novel_stop_codon_count"] > 0
+
+
+def safe_std(values):
+    if len(values) <= 1:
+        return 0.0
+    return statistics.stdev(values)
+
+
+def safe_mean(values):
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def safe_std_finite(values):
+    finite_values = [v for v in values if math.isfinite(v)]
+    if len(finite_values) <= 1:
+        return 0.0
+    return statistics.stdev(finite_values)
+
+
+def parent_can_reproduce(parent, tolerated_additional_stop_codons: int) -> bool:
+    """
+    Parent can reproduce only if:
+    - all expected stop positions from the start sequence are still present
+    - novel stop-position count is within tolerance
+    """
+    return (
+        parent["missing_expected_stop_count"] == 0
+        and parent["novel_stop_codon_count"] <= tolerated_additional_stop_codons
+    )
+
+
+def extract_single_orf_sequence(sequence: str, orf):
+    """
+    Extract one ORF from the sequence.
+    """
+    start0 = orf["start_1based"] - 1
+    end0_exclusive = orf["end_1based"]
+    return sequence[start0:end0_exclusive]
+
+
+def extract_concatenated_orf_sequence(sequence: str, orf_regions):
+    parts = []
+    for orf in orf_regions:
+        parts.append(extract_single_orf_sequence(sequence, orf))
+    return "".join(parts)
+
+
+def count_codons_in_sequence(coding_sequence: str):
+    if len(coding_sequence) % 3 != 0:
+        raise ValueError("Concatenated ORF sequence length is not divisible by 3.")
+
+    codon_counts = Counter()
+    for i in range(0, len(coding_sequence), 3):
+        codon = coding_sequence[i:i + 3]
+        codon_counts[codon] += 1
+    return codon_counts
+
+
+def compute_rscu_vector_from_coding_sequence(coding_sequence: str):
+    """
+    Compute an RSCU vector from a coding sequence whose length is divisible by 3.
+    Stop codons are excluded from the RSCU vector.
+    """
+    codon_counts = count_codons_in_sequence(coding_sequence)
+    rscu = {}
+
+    for aa, codons in SENSE_AA_TO_CODONS.items():
+        total = sum(codon_counts.get(codon, 0) for codon in codons)
+        n_syn = len(codons)
+
+        if total == 0:
+            for codon in codons:
+                rscu[codon] = 0.0
+        else:
+            expected = total / n_syn
+            for codon in codons:
+                rscu[codon] = codon_counts.get(codon, 0) / expected
+
+    return [rscu[codon] for codon in SENSE_CODON_ORDER]
+
+
+def compute_rscu_vector(sequence: str, orf_regions):
+    """
+    Compute RSCU from the concatenated ORFs.
+    """
+    coding_sequence = extract_concatenated_orf_sequence(sequence, orf_regions)
+    return compute_rscu_vector_from_coding_sequence(coding_sequence)
+
+
+def compute_rscu_vectors_by_orf(sequence: str, orf_regions):
+    """
+    Compute one RSCU vector per ORF.
+
+    Returns:
+      dict mapping orf_name -> RSCU vector
+    """
+    result = {}
+
+    for orf in orf_regions:
+        orf_seq = extract_single_orf_sequence(sequence, orf)
+        result[orf["orf_name"]] = compute_rscu_vector_from_coding_sequence(orf_seq)
+
+    return result
+
+
+def cosine_distance(vec1, vec2):
+    if len(vec1) != len(vec2):
+        raise ValueError("Vectors must be same length.")
+
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 1.0
+
+    cosine_similarity = dot / (norm1 * norm2)
+    return 1.0 - cosine_similarity
+
+
+def load_reference_rscu_tsv(reference_tsv: str):
+    references = {}
+
+    with open(reference_tsv, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required_columns = {"reference_name"} | set(CODON_ORDER)
+        missing = required_columns - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"Reference TSV missing required columns: {sorted(missing)}")
+
+        for row in reader:
+            name = row["reference_name"]
+            references[name] = {
+                "sense_vector": [float(row[codon]) for codon in SENSE_CODON_ORDER]
+            }
+
+    if len(references) < 2:
+        raise ValueError("Reference TSV must contain at least two reference rows.")
+
+    return references
+
+
+def get_reference_name_for_generation(generation: int, cycle_n: int, ref1_name: str, ref2_name: str):
+    cycle_len = cycle_n + 1
+    pos = (generation - 1) % cycle_len
+    if pos < cycle_n:
+        return ref1_name
+    return ref2_name
+
+
+def compute_scalings(ranks, adaptation_scaling, mode):
+    N = len(ranks)
+
+    if N <= 1:
+        return [1.0]
+
+    mean_rank = (N - 1) / 2.0
+    normalized_ranks = [
+        (rank - mean_rank) / mean_rank
+        for rank in ranks
+    ]
+
+    if mode == "linear":
+        scalings = [
+            max(0.0, 1.0 - adaptation_scaling * r)
+            for r in normalized_ranks
+        ]
+
+    elif mode == "exponential":
+        scalings = [
+            math.exp(-adaptation_scaling * r)
+            for r in normalized_ranks
+        ]
+
+    elif mode == "exponential_normalized":
+        raw = [
+            math.exp(-adaptation_scaling * r)
+            for r in normalized_ranks
+        ]
+        mean_val = sum(raw) / len(raw)
+        scalings = [x / mean_val for x in raw]
+
+    else:
+        raise ValueError(f"Unknown adaptation mode: {mode}")
+
+    return scalings
+
+
+def write_parent_rscu_combined(parents, orf_regions, outdir):
+    """
+    Write combined-ORF RSCU values for each parent.
+    """
+    output_path = os.path.join(outdir, "parent_rscu_combined.tsv")
+
+    with open(output_path, "w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["parent_id"] + SENSE_CODON_ORDER)
+
+        for parent in parents:
+            rscu_vec = compute_rscu_vector(parent["sequence"], orf_regions)
+            writer.writerow([parent["parent_id"]] + rscu_vec)
+
+
+def write_parent_rscu_by_orf(parents, orf_regions, outdir):
+    """
+    Write per-ORF RSCU values for each parent.
+    """
+    output_path = os.path.join(outdir, "parent_rscu_by_orf.tsv")
+
+    with open(output_path, "w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["parent_id", "orf_name"] + SENSE_CODON_ORDER)
+
+        for parent in parents:
+            rscu_by_orf = compute_rscu_vectors_by_orf(parent["sequence"], orf_regions)
+            for orf_name, rscu_vec in rscu_by_orf.items():
+                writer.writerow([parent["parent_id"], orf_name] + rscu_vec)
+
+
+def write_parent_set(parents, orf_regions, outdir):
+    os.makedirs(outdir, exist_ok=True)
+
+    manifest_path = os.path.join(outdir, "parents_manifest.txt")
+    metadata_path = os.path.join(outdir, "parent_metadata.tsv")
+
+    with open(manifest_path, "w") as manifest, open(metadata_path, "w", newline="") as meta:
+        writer = csv.writer(meta, delimiter="\t")
+        writer.writerow([
+            "parent_id",
+            "total_stop_codon_count",
+            "novel_stop_codon_count",
+            "missing_expected_stop_count",
+            "is_viable",
+            "stop_codon",
+            "codon_start_1based",
+            "codon_index_global_1based",
+            "first_stop_orf_name",
+            "codon_index_within_orf_1based",
+            "mutated_nt_index_1based",
+            "synonymous_mutation_count",
+            "nonsynonymous_mutation_count",
+            "synonymous_site_count",
+            "nonsynonymous_site_count",
+            "pS",
+            "pN",
+            "dnds",
+            "region_penalty_factor",
+            "mutated_penalty_region_count",
+            "mutated_penalty_regions",
+            "reference_used",
+            "similarity_index",
+            "reproductive_score",
+            "effective_reproductive_score",
+            "sequence"
+        ])
+
+        for i, parent in enumerate(parents):
+            fasta_id = f"parent_{i:03d}"
+            fasta_path = os.path.join(outdir, f"{fasta_id}.fasta")
+
+            rec = SeqRecord(Seq(parent["sequence"]), id=fasta_id, description="")
+            with open(fasta_path, "w") as handle:
+                SeqIO.write(rec, handle, "fasta")
+
+            manifest.write(fasta_path + "\n")
+
+            writer.writerow([
+                parent["parent_id"],
+                parent["total_stop_codon_count"],
+                parent["novel_stop_codon_count"],
+                parent["missing_expected_stop_count"],
+                int(parent["is_viable"]),
+                parent["stop_codon"],
+                parent["codon_start_1based"],
+                parent["codon_index_global_1based"],
+                parent["first_stop_orf_name"],
+                parent["codon_index_within_orf_1based"],
+                parent["mutated_nt_index_1based"],
+                parent["synonymous_mutation_count"],
+                parent["nonsynonymous_mutation_count"],
+                parent["synonymous_site_count"],
+                parent["nonsynonymous_site_count"],
+                parent["pS"],
+                parent["pN"],
+                parent["dnds"],
+                parent["region_penalty_factor"],
+                parent["mutated_penalty_region_count"],
+                parent["mutated_penalty_regions"],
+                parent["reference_used"],
+                parent["similarity_index"],
+                parent["reproductive_score"],
+                parent["effective_reproductive_score"],
+                parent["sequence"]
+            ])
+
+    write_parent_rscu_combined(parents, orf_regions, outdir)
+    write_parent_rscu_by_orf(parents, orf_regions, outdir)
+
+
+def write_checkpoint_record(record_dir, generation, variants):
+    os.makedirs(record_dir, exist_ok=True)
+
+    viable_fasta = os.path.join(record_dir, f"gen_{generation:03d}_viable_variants.fasta")
+    stop_fasta = os.path.join(record_dir, f"gen_{generation:03d}_stop_variants.fasta")
+    variant_log = os.path.join(record_dir, f"gen_{generation:03d}_all_variants.tsv")
+
+    with open(viable_fasta, "w") as viable_out, open(stop_fasta, "w") as stop_out, open(variant_log, "w", newline="") as tsv_out:
+        writer = csv.writer(tsv_out, delimiter="\t")
+        writer.writerow([
+            "simulation_index",
+            "source_parent_id",
+            "total_stop_codon_count",
+            "novel_stop_codon_count",
+            "missing_expected_stop_count",
+            "is_viable",
+            "stop_codon",
+            "codon_start_1based",
+            "codon_index_global_1based",
+            "first_stop_orf_name",
+            "codon_index_within_orf_1based",
+            "mutated_nt_index_1based",
+            "sequence"
+        ])
+
+        viable_i = 1
+        stop_i = 1
+
+        for variant in variants:
+            writer.writerow([
+                variant["simulation_index"],
+                variant["source_parent_id"],
+                variant["total_stop_codon_count"],
+                variant["novel_stop_codon_count"],
+                variant["missing_expected_stop_count"],
+                int(variant["is_viable"]),
+                variant["stop_codon"],
+                variant["codon_start_1based"],
+                variant["codon_index_global_1based"],
+                variant["first_stop_orf_name"],
+                variant["codon_index_within_orf_1based"],
+                variant["mutated_nt_index_1based"],
+                variant["sequence"]
+            ])
+
+            if variant["missing_expected_stop_count"] == 0 and variant["novel_stop_codon_count"] == 0:
+                viable_out.write(f">gen{generation:03d}_viable_{viable_i}\n{variant['sequence']}\n")
+                viable_i += 1
+            else:
+                stop_out.write(f">gen{generation:03d}_stop_{stop_i}\n{variant['sequence']}\n")
+                stop_i += 1
+
+
+def append_generation_summary(summary_path, generation, reference_used, sampled_parent_count,
+                              reproductive_parent_count, total_requested_progeny,
+                              total_realized_variants, structurally_valid_variant_count,
+                              novel_stop_variant_count, taa_count, tag_count, tga_count,
+                              mean_similarity_index_ref1, mean_similarity_index_ref2,
+                              std_similarity_index_ref1, std_similarity_index_ref2,
+                              mean_dnds_parents, std_dnds_parents,
+                              mean_region_penalty_factor, std_region_penalty_factor,
+                              mean_effective_reproductive_score,
+                              proportion_variants_with_novel_stops,
+                              proportion_variants_with_only_original_stops,
+                              proportion_stop_variants_with_novel_stops,
+                              proportion_stop_variants_with_only_original_stops,
+                              checkpoint_written):
+    write_header = not os.path.exists(summary_path)
+
+    with open(summary_path, "a", newline="") as out:
+        writer = csv.writer(out, delimiter="\t")
+        if write_header:
+            writer.writerow([
+                "generation",
+                "reference_used",
+                "sampled_parent_count",
+                "reproductive_parent_count",
+                "total_requested_progeny",
+                "total_realized_variants",
+                "structurally_valid_variant_count",
+                "novel_stop_variant_count",
+                "TAA_count",
+                "TAG_count",
+                "TGA_count",
+                "mean_similarity_index_ref1",
+                "mean_similarity_index_ref2",
+                "std_similarity_index_ref1",
+                "std_similarity_index_ref2",
+                "mean_dnds_parents",
+                "std_dnds_parents",
+                "mean_region_penalty_factor",
+                "std_region_penalty_factor",
+                "mean_effective_reproductive_score",
+                "proportion_variants_with_novel_stops",
+                "proportion_variants_with_only_original_stops",
+                "proportion_stop_variants_with_novel_stops",
+                "proportion_stop_variants_with_only_original_stops",
+                "checkpoint_written"
+            ])
+
+        writer.writerow([
+            generation,
+            reference_used,
+            sampled_parent_count,
+            reproductive_parent_count,
+            total_requested_progeny,
+            total_realized_variants,
+            structurally_valid_variant_count,
+            novel_stop_variant_count,
+            taa_count,
+            tag_count,
+            tga_count,
+            mean_similarity_index_ref1,
+            mean_similarity_index_ref2,
+            std_similarity_index_ref1,
+            std_similarity_index_ref2,
+            mean_dnds_parents,
+            std_dnds_parents,
+            mean_region_penalty_factor,
+            std_region_penalty_factor,
+            mean_effective_reproductive_score,
+            proportion_variants_with_novel_stops,
+            proportion_variants_with_only_original_stops,
+            proportion_stop_variants_with_novel_stops,
+            proportion_stop_variants_with_only_original_stops,
+            int(checkpoint_written)
+        ])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--config-tsv", required=True)
+    parser.add_argument("--start-fasta", required=True)
+    parser.add_argument("--orf-file", required=True)
+    parser.add_argument("--reference-rscu", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--penalty-regions", default=None)
+
+    args = parser.parse_args()
+
+    cfg = load_config_tsv(args.config_tsv)
+    orf_regions = load_orf_regions(args.orf_file)
+    mutation_probabilities = get_mutation_probabilities(int(cfg["mutation_set"]))
+    reference_vectors = load_reference_rscu_tsv(args.reference_rscu)
+    penalty_regions = load_penalty_regions(args.penalty_regions) if args.penalty_regions else []
+
+    mutation_rate = float(cfg["mutation_rate"])
+    num_generations = int(cfg["num_generations"])
+    record_interval = int(cfg["record_interval"])
+    sample_size = int(cfg["sample_size"])
+    progeny_scale = float(cfg["progeny_scale"])
+    tolerated_additional_stop_codons = int(cfg["tolerated_additional_stop_codons"])
+    cpus = int(cfg["cpus"])
+    seed = int(cfg["seed"])
+
+    reference1_name = cfg["reference1_name"]
+    reference2_name = cfg["reference2_name"]
+    reference_cycle_n = int(cfg["reference_cycle_n"])
+
+    adaptation_scaling_ref1 = float(cfg["adaptation_scaling_ref1"])
+    adaptation_scaling_ref2 = float(cfg["adaptation_scaling_ref2"])
+    adaptation_mode = cfg["adaptation_mode"]
+
+    max_progeny_per_parent = int(cfg["max_progeny_per_parent"])
+
+    if reference1_name not in reference_vectors:
+        raise ValueError(f"Reference not found in reference TSV: {reference1_name}")
+    if reference2_name not in reference_vectors:
+        raise ValueError(f"Reference not found in reference TSV: {reference2_name}")
+
+    rng = random.Random(seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    original_sequence, expected_stop_signatures = get_original_stop_set(args.start_fasta, orf_regions)
+
+    current_parents = load_initial_parent(
+        args.start_fasta,
+        orf_regions,
+        expected_stop_signatures
+    )
+
+    write_parent_set(current_parents, orf_regions, os.path.join(args.output_dir, "gen_001_parents"))
+    summary_path = os.path.join(args.output_dir, "generation_summaries.tsv")
+
+    for generation in range(1, num_generations + 1):
+        reference_name = get_reference_name_for_generation(
+            generation=generation,
+            cycle_n=reference_cycle_n,
+            ref1_name=reference1_name,
+            ref2_name=reference2_name
+        )
+
+        ref1_vector = reference_vectors[reference1_name]["sense_vector"]
+        ref2_vector = reference_vectors[reference2_name]["sense_vector"]
+        active_reference_vector = reference_vectors[reference_name]["sense_vector"]
+
+        reproductive_parents = [
+            p for p in current_parents
+            if parent_can_reproduce(p, tolerated_additional_stop_codons)
+        ]
+
+        print(f"Generation {generation}: sampled parents = {len(current_parents)}")
+        print(f"Generation {generation}: reproductive parents = {len(reproductive_parents)}")
+        print(f"Generation {generation}: active reference = {reference_name}")
+
+        if not reproductive_parents:
+            raise RuntimeError(
+                f"No parents available to produce generation {generation} "
+                f"under current novel-stop threshold."
+            )
+
+        parent_scores = []
+        ref1_distances = []
+        ref2_distances = []
+
+        for parent in reproductive_parents:
+            parent_rscu = compute_rscu_vector(parent["sequence"], orf_regions)
+
+            dist_ref1 = cosine_distance(parent_rscu, ref1_vector)
+            dist_ref2 = cosine_distance(parent_rscu, ref2_vector)
+
+            ref1_distances.append(dist_ref1)
+            ref2_distances.append(dist_ref2)
+
+            active_dist = cosine_distance(parent_rscu, active_reference_vector)
+
+            parent["reference_used"] = reference_name
+            parent["similarity_index"] = active_dist
+
+            parent_scores.append((parent, active_dist))
+
+        mean_similarity_index_ref1 = sum(ref1_distances) / len(ref1_distances)
+        mean_similarity_index_ref2 = sum(ref2_distances) / len(ref2_distances)
+
+        std_similarity_index_ref1 = safe_std(ref1_distances)
+        std_similarity_index_ref2 = safe_std(ref2_distances)
+
+        parent_scores.sort(key=lambda x: x[1])
+
+        adaptation_scaling = adaptation_scaling_ref1 if reference_name == reference1_name else adaptation_scaling_ref2
+
+        ranks = list(range(len(parent_scores)))
+        scalings = compute_scalings(
+            ranks=ranks,
+            adaptation_scaling=adaptation_scaling,
+            mode=adaptation_mode
+        )
+
+        progeny_counts = []
+        for (parent, dist), scaling in zip(parent_scores, scalings):
+            if "region_penalty_factor" not in parent or parent["region_penalty_factor"] == "":
+                parent["region_penalty_factor"] = 1.0
+            if "mutated_penalty_region_count" not in parent or parent["mutated_penalty_region_count"] == "":
+                parent["mutated_penalty_region_count"] = 0
+            if "mutated_penalty_regions" not in parent or parent["mutated_penalty_regions"] == "":
+                parent["mutated_penalty_regions"] = ""
+
+            effective_weight = scaling * parent["region_penalty_factor"]
+
+            parent["reproductive_score"] = scaling
+            parent["effective_reproductive_score"] = effective_weight
+
+            progeny = int(round(progeny_scale * effective_weight))
+            progeny = min(progeny, max_progeny_per_parent)
+
+            progeny_counts.append((parent, progeny))
+
+        total_requested_progeny = sum(n for _, n in progeny_counts)
+
+        if total_requested_progeny == 0:
+            raise RuntimeError(
+                f"All reproductive parents received zero progeny in generation {generation}."
+            )
+
+        task_args = []
+        for parent_idx, (parent, n_sims) in enumerate(progeny_counts):
+            if n_sims <= 0:
+                continue
+
+            task_args.append((
+                parent["parent_id"],
+                parent["sequence"],
+                n_sims,
+                mutation_rate,
+                mutation_probabilities,
+                orf_regions,
+                expected_stop_signatures,
+                seed + generation * 100000 + parent_idx
+            ))
+
+        all_variants = []
+        with Pool(processes=cpus) as pool:
+            for variant_list in pool.map(simulate_parent_batch, task_args):
+                all_variants.extend(variant_list)
+
+        if not all_variants:
+            raise RuntimeError(f"No variants produced in generation {generation}.")
+
+        structurally_valid_variants = [
+            v for v in all_variants
+            if v["missing_expected_stop_count"] == 0 and v["novel_stop_codon_count"] == 0
+        ]
+        novel_stop_variants = [
+            v for v in all_variants
+            if v["novel_stop_codon_count"] > 0
+        ]
+        only_original_stop_variants = [
+            v for v in all_variants
+            if v["novel_stop_codon_count"] == 0 and v["missing_expected_stop_count"] > 0
+        ]
+
+        if len(all_variants) > 0:
+            proportion_variants_with_novel_stops = len(novel_stop_variants) / len(all_variants)
+            proportion_variants_with_only_original_stops = len(only_original_stop_variants) / len(all_variants)
+        else:
+            proportion_variants_with_novel_stops = 0.0
+            proportion_variants_with_only_original_stops = 0.0
+
+        stop_issue_variants = [
+            v for v in all_variants
+            if v["novel_stop_codon_count"] > 0 or v["missing_expected_stop_count"] > 0
+        ]
+
+        if len(stop_issue_variants) > 0:
+            proportion_stop_variants_with_novel_stops = (
+                len([v for v in stop_issue_variants if variant_has_novel_stop(v)]) / len(stop_issue_variants)
+            )
+            proportion_stop_variants_with_only_original_stops = (
+                len([v for v in stop_issue_variants if not variant_has_novel_stop(v)]) / len(stop_issue_variants)
+            )
+        else:
+            proportion_stop_variants_with_novel_stops = 0.0
+            proportion_stop_variants_with_only_original_stops = 0.0
+
+        stop_counter = Counter(v["stop_codon"] for v in novel_stop_variants if v["stop_codon"])
+        taa_count = stop_counter.get("TAA", 0)
+        tag_count = stop_counter.get("TAG", 0)
+        tga_count = stop_counter.get("TGA", 0)
+
+        checkpoint_written = (generation % record_interval == 0)
+        if checkpoint_written:
+            record_dir = os.path.join(args.output_dir, f"gen_{generation:03d}_record")
+            write_checkpoint_record(record_dir, generation, all_variants)
+
+        if generation < num_generations:
+            sampled_n = min(sample_size, len(all_variants))
+            sampled_variants = rng.sample(all_variants, sampled_n)
+
+            next_parents = []
+            for i, variant in enumerate(sampled_variants):
+                dnds_stats = calculate_parent_dnds(
+                    reference_sequence=original_sequence,
+                    query_sequence=variant["sequence"],
+                    orf_regions=orf_regions
+                )
+
+                penalty_stats = calculate_region_penalty(
+                    reference_sequence=original_sequence,
+                    query_sequence=variant["sequence"],
+                    penalty_regions=penalty_regions
+                )
+
+                next_parents.append({
+                    "parent_id": f"gen{generation + 1:03d}_parent_{i:03d}",
+                    "sequence": variant["sequence"],
+                    "total_stop_codon_count": variant["total_stop_codon_count"],
+                    "novel_stop_codon_count": variant["novel_stop_codon_count"],
+                    "missing_expected_stop_count": variant["missing_expected_stop_count"],
+                    "is_viable": variant["is_viable"],
+                    "stop_codon": variant["stop_codon"],
+                    "codon_start_1based": variant["codon_start_1based"],
+                    "codon_index_global_1based": variant["codon_index_global_1based"],
+                    "first_stop_orf_name": variant["first_stop_orf_name"],
+                    "codon_index_within_orf_1based": variant["codon_index_within_orf_1based"],
+                    "mutated_nt_index_1based": variant["mutated_nt_index_1based"],
+                    "synonymous_mutation_count": dnds_stats["synonymous_mutation_count"],
+                    "nonsynonymous_mutation_count": dnds_stats["nonsynonymous_mutation_count"],
+                    "synonymous_site_count": dnds_stats["synonymous_site_count"],
+                    "nonsynonymous_site_count": dnds_stats["nonsynonymous_site_count"],
+                    "pS": dnds_stats["pS"],
+                    "pN": dnds_stats["pN"],
+                    "dnds": dnds_stats["dnds"],
+                    "region_penalty_factor": penalty_stats["region_penalty_factor"],
+                    "mutated_penalty_region_count": penalty_stats["mutated_penalty_region_count"],
+                    "mutated_penalty_regions": ",".join(penalty_stats["mutated_penalty_regions"]),
+                    "reference_used": "",
+                    "similarity_index": "",
+                    "reproductive_score": "",
+                    "effective_reproductive_score": ""
+                })
+
+            finite_dnds_values = [p["dnds"] for p in next_parents if math.isfinite(p["dnds"])]
+            mean_dnds_parents = safe_mean(finite_dnds_values)
+            std_dnds_parents = safe_std_finite(finite_dnds_values)
+
+            penalty_values = [p["region_penalty_factor"] for p in next_parents]
+            mean_region_penalty_factor = safe_mean(penalty_values)
+            std_region_penalty_factor = safe_std(penalty_values) if len(penalty_values) > 1 else 0.0
+
+            next_parent_dir = os.path.join(args.output_dir, f"gen_{generation + 1:03d}_parents")
+            write_parent_set(next_parents, orf_regions, next_parent_dir)
+        else:
+            next_parents = []
+            mean_dnds_parents = 0.0
+            std_dnds_parents = 0.0
+            mean_region_penalty_factor = 0.0
+            std_region_penalty_factor = 0.0
+
+        effective_scores = [
+            p["effective_reproductive_score"]
+            for p in reproductive_parents
+            if p.get("effective_reproductive_score", "") != ""
+        ]
+        mean_effective_reproductive_score = safe_mean(effective_scores) if effective_scores else 0.0
+
+        append_generation_summary(
+            summary_path=summary_path,
+            generation=generation,
+            reference_used=reference_name,
+            sampled_parent_count=len(current_parents),
+            reproductive_parent_count=len(reproductive_parents),
+            total_requested_progeny=total_requested_progeny,
+            total_realized_variants=len(all_variants),
+            structurally_valid_variant_count=len(structurally_valid_variants),
+            novel_stop_variant_count=len(novel_stop_variants),
+            taa_count=taa_count,
+            tag_count=tag_count,
+            tga_count=tga_count,
+            mean_similarity_index_ref1=mean_similarity_index_ref1,
+            mean_similarity_index_ref2=mean_similarity_index_ref2,
+            std_similarity_index_ref1=std_similarity_index_ref1,
+            std_similarity_index_ref2=std_similarity_index_ref2,
+            mean_dnds_parents=mean_dnds_parents,
+            std_dnds_parents=std_dnds_parents,
+            mean_region_penalty_factor=mean_region_penalty_factor,
+            std_region_penalty_factor=std_region_penalty_factor,
+            mean_effective_reproductive_score=mean_effective_reproductive_score,
+            proportion_variants_with_novel_stops=proportion_variants_with_novel_stops,
+            proportion_variants_with_only_original_stops=proportion_variants_with_only_original_stops,
+            proportion_stop_variants_with_novel_stops=proportion_stop_variants_with_novel_stops,
+            proportion_stop_variants_with_only_original_stops=proportion_stop_variants_with_only_original_stops,
+            checkpoint_written=checkpoint_written
+        )
+
+        current_parents = next_parents
+
+    print(f"Done. Summary written to {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
