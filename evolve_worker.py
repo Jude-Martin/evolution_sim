@@ -33,6 +33,13 @@ mutation_probabilities_set4_4X = {
     'T': [0.13576939 / 0.370029, 0.10137649 / 0.370029, 0.13288312 / 0.370029]
 }
 
+mutation_probabilities_set5_neutral = {
+    'A': [1 / 3, 1 / 3, 1 / 3],
+    'C': [1 / 3, 1 / 3, 1 / 3],
+    'G': [1 / 3, 1 / 3, 1 / 3],
+    'T': [1 / 3, 1 / 3, 1 / 3]
+}
+
 
 def get_mutation_probabilities(set_id: int):
     if set_id == 1:
@@ -43,6 +50,9 @@ def get_mutation_probabilities(set_id: int):
         return mutation_probabilities_set3_3X
     if set_id == 4:
         return mutation_probabilities_set4_4X
+     if set_id == 5:
+        return mutation_probabilities_set5_neutral
+    
     raise ValueError(f"Invalid mutation set: {set_id}")
 
 
