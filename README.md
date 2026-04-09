@@ -36,3 +36,15 @@ mean_rank is calculated, normalised converted to a weighting factor and used to 
 To check orfs prior to running:
 
 python check_orfs.py   --start-fasta start.fasta --orf-file orfs.tsv  --output-fasta extracted_orfs.fasta
+
+To plot hotspots for stop codon sites
+
+python plot_stop_hotspots.py \
+  --input-tsv output/gen_005_record/gen_005_novel_stop_events.tsv \
+  --label gen005 \
+  --input-tsv output/gen_010_record/gen_010_novel_stop_events.tsv \
+  --label gen010 \
+  --sequence-length 2400 \
+  --window-width 50 \
+  --shade-regions shade_regions.tsv \
+  --output-dir hotspot_plots
