@@ -33,13 +33,6 @@ mutation_probabilities_set4_4X = {
     'T': [0.13576939 / 0.370029, 0.10137649 / 0.370029, 0.13288312 / 0.370029]
 }
 
-mutation_probabilities_set5_neutral = {
-    'A': [1 / 3, 1 / 3, 1 / 3],
-    'C': [1 / 3, 1 / 3, 1 / 3],
-    'G': [1 / 3, 1 / 3, 1 / 3],
-    'T': [1 / 3, 1 / 3, 1 / 3]
-}
-
 
 def get_mutation_probabilities(set_id: int):
     if set_id == 1:
@@ -50,9 +43,6 @@ def get_mutation_probabilities(set_id: int):
         return mutation_probabilities_set3_3X
     if set_id == 4:
         return mutation_probabilities_set4_4X
-     if set_id == 5:
-        return mutation_probabilities_set5_neutral
-    
     raise ValueError(f"Invalid mutation set: {set_id}")
 
 
@@ -60,15 +50,11 @@ def load_orf_regions(orffile: str):
     """
     Load ORFs from a TSV with columns:
         orf_name    start_1based    end_1based
-
-    Coordinates are 1-based inclusive.
-    Each ORF length must be divisible by 3.
     """
     orfs = []
 
     with open(orffile, "r", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-
         required = {"orf_name", "start_1based", "end_1based"}
         if not required.issubset(reader.fieldnames or set()):
             raise ValueError(f"ORF TSV must contain columns: {sorted(required)}")
@@ -115,15 +101,7 @@ def mutate_nucleotide(nucleotide: str, mutation_probabilities: dict) -> str:
 
 def analyze_orf_stops(sequence: str, orfs):
     """
-    Analyze all stop codons inside ORFs.
-
-    Returns a stop list with:
-      stop_codon
-      codon_start_1based
-      codon_index_global_1based
-      first_stop_orf_name
-      codon_index_within_orf_1based
-      is_terminal_orf_stop
+    Return all in-frame stop codons inside the ORFs.
     """
     stops = []
 
@@ -135,7 +113,7 @@ def analyze_orf_stops(sequence: str, orfs):
         codon_idx_within_orf = 0
         for i in range(start0, end1 - 2, 3):
             codon_idx_within_orf += 1
-            codon = sequence[i:i+3]
+            codon = sequence[i:i + 3]
 
             if codon in STOP_CODONS:
                 stops.append({
@@ -155,10 +133,8 @@ def analyze_orf_stops(sequence: str, orfs):
 
 def build_stop_signature_set(stop_list):
     """
-    Convert a stop list into a set of stop-position signatures:
+    Signature is position-only:
       (orf_name, codon_index_within_orf_1based)
-
-    Stop identity is ignored.
     """
     signatures = set()
     for stop in stop_list:
@@ -171,17 +147,7 @@ def build_stop_signature_set(stop_list):
 
 def summarize_stops_against_expected(sequence: str, orfs, expected_stop_signatures):
     """
-    Compare a sequence's stop positions against the expected stop-position set
-    derived from the starting FASTA.
-
-    Expected signatures are position-only:
-      (orf_name, codon_index_within_orf_1based)
-
-    Returns:
-      total_stop_codon_count
-      novel_stop_codon_count
-      missing_expected_stop_count
-      stop_list
+    Compare observed stop positions against expected stop positions from the start FASTA.
     """
     stop_info = analyze_orf_stops(sequence, orfs)
     stop_list = stop_info["stop_list"]
@@ -204,7 +170,7 @@ def summarize_stops_against_expected(sequence: str, orfs, expected_stop_signatur
 def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: dict,
                  orfs, expected_stop_signatures):
     """
-    Simulate one descendant sequence from one parent.
+    Simulate one descendant sequence from one parent and retain all novel stop events.
     """
     seq = list(sequence)
 
@@ -221,8 +187,17 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
     )
     stop_list = stop_summary["stop_list"]
 
-    if stop_list:
-        first = stop_list[0]
+    novel_stop_events = []
+    for stop in stop_list:
+        sig = (
+            stop["first_stop_orf_name"],
+            stop["codon_index_within_orf_1based"],
+        )
+        if sig not in expected_stop_signatures:
+            novel_stop_events.append(stop)
+
+    if novel_stop_events:
+        first = novel_stop_events[0]
         stop_codon = first["stop_codon"]
         codon_start_1based = first["codon_start_1based"]
         codon_index_global_1based = first["codon_index_global_1based"]
@@ -238,11 +213,11 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
     return {
         "sequence": final_seq,
         "total_stop_codon_count": stop_summary["total_stop_codon_count"],
-        "novel_stop_codon_count": stop_summary["novel_stop_codon_count"],
+        "novel_stop_codon_count": len(novel_stop_events),
         "missing_expected_stop_count": stop_summary["missing_expected_stop_count"],
         "is_viable": (
             stop_summary["missing_expected_stop_count"] == 0
-            and stop_summary["novel_stop_codon_count"] == 0
+            and len(novel_stop_events) == 0
         ),
         "stop_codon": stop_codon,
         "codon_start_1based": codon_start_1based,
@@ -251,13 +226,11 @@ def simulate_one(sequence: str, mutation_rate: float, mutation_probabilities: di
         "codon_index_within_orf_1based": codon_index_within_orf_1based,
         "mutated_nt_index_1based": "",
         "stop_signatures": stop_list,
+        "novel_stop_events": novel_stop_events,
     }
 
 
 def simulate_parent_batch(args):
-    """
-    Simulate many descendants from one parent.
-    """
     (
         parent_id,
         parent_seq,
