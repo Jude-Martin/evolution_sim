@@ -1,12 +1,26 @@
+#!/usr/bin/env python3
+
 import argparse
 import csv
 import os
 import matplotlib.pyplot as plt
 
 
+PLOT_CHOICES = [
+    "similarity",
+    "dnds",
+    "novel_stop_count",
+    "structurally_valid",
+    "novel_stop_proportion",
+    "stop_breakdown",
+    "viable_parent_count",
+    "viable_parent_proportion",
+]
+
+
 def load_summary_tsv(path):
     """
-    Load generation summary metrics from TSV.
+    Load one generation summary TSV.
     """
     rows = []
     with open(path, "r", newline="") as handle:
@@ -42,160 +56,201 @@ def load_summary_tsv(path):
     return rows
 
 
-def plot_similarity(rows, output_path):
-    """
-    Plot mean Similarity Index to both references over time with SD error bars.
-    """
-    generations = [r["generation"] for r in rows]
-    sim_ref1 = [r["mean_similarity_index_ref1"] for r in rows]
-    sim_ref2 = [r["mean_similarity_index_ref2"] for r in rows]
-    std_ref1 = [r["std_similarity_index_ref1"] for r in rows]
-    std_ref2 = [r["std_similarity_index_ref2"] for r in rows]
+def set_optional_ymax(ymax):
+    if ymax is not None:
+        bottom, _ = plt.ylim()
+        plt.ylim(bottom=bottom, top=ymax)
 
+
+def plot_similarity(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.errorbar(generations, sim_ref1, yerr=std_ref1, fmt='-o', capsize=3, label="Mean Similarity Index to ref1")
-    plt.errorbar(generations, sim_ref2, yerr=std_ref2, fmt='-o', capsize=3, label="Mean Similarity Index to ref2")
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+
+        generations = [r["generation"] for r in rows]
+        sim_ref1 = [r["mean_similarity_index_ref1"] for r in rows]
+        sim_ref2 = [r["mean_similarity_index_ref2"] for r in rows]
+        std_ref1 = [r["std_similarity_index_ref1"] for r in rows]
+        std_ref2 = [r["std_similarity_index_ref2"] for r in rows]
+
+        plt.errorbar(
+            generations,
+            sim_ref1,
+            yerr=std_ref1,
+            fmt='-o',
+            capsize=3,
+            label=f"{label} ref1",
+        )
+        plt.errorbar(
+            generations,
+            sim_ref2,
+            yerr=std_ref2,
+            fmt='--o',
+            capsize=3,
+            label=f"{label} ref2",
+        )
+
     plt.xlabel("Generation")
     plt.ylabel("Similarity Index (cosine distance)")
     plt.title("Mean Similarity Index over Time")
+    set_optional_ymax(ymax)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_dnds(rows, output_path):
-    """
-    Plot mean dN/dS across sampled parents with SD error bars.
-    """
-    generations = [r["generation"] for r in rows]
-    mean_dnds = [r["mean_dnds_parents"] for r in rows]
-    std_dnds = [r["std_dnds_parents"] for r in rows]
-
+def plot_dnds(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.errorbar(generations, mean_dnds, yerr=std_dnds, fmt='-o', capsize=3)
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+
+        generations = [r["generation"] for r in rows]
+        mean_dnds = [r["mean_dnds_parents"] for r in rows]
+        std_dnds = [r["std_dnds_parents"] for r in rows]
+
+        plt.errorbar(
+            generations,
+            mean_dnds,
+            yerr=std_dnds,
+            fmt='-o',
+            capsize=3,
+            label=label,
+        )
+
     plt.xlabel("Generation")
     plt.ylabel("Mean dN/dS across sampled parents")
     plt.title("dN/dS over Time")
+    set_optional_ymax(ymax)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_novel_stop_counts(rows, output_path):
-    """
-    Plot the number of progeny per generation that contain novel stop-position issues.
-    """
-    generations = [r["generation"] for r in rows]
-    stop_counts = [r["novel_stop_variant_count"] for r in rows]
-
+def plot_novel_stop_counts(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, stop_counts, marker='o')
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        stop_counts = [r["novel_stop_variant_count"] for r in rows]
+        plt.plot(generations, stop_counts, marker='o', label=label)
+
     plt.xlabel("Generation")
     plt.ylabel("Number of progeny with novel stop issues")
     plt.title("Novel Stop Variants over Time")
+    set_optional_ymax(ymax)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_structurally_valid_counts(rows, output_path):
-    """
-    Plot the number of structurally valid progeny per generation.
-    """
-    generations = [r["generation"] for r in rows]
-    valid_counts = [r["structurally_valid_variant_count"] for r in rows]
-
+def plot_structurally_valid_counts(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, valid_counts, marker='o')
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        valid_counts = [r["structurally_valid_variant_count"] for r in rows]
+        plt.plot(generations, valid_counts, marker='o', label=label)
+
     plt.xlabel("Generation")
     plt.ylabel("Number of structurally valid progeny")
     plt.title("Structurally Valid Variants over Time")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-
-
-def plot_novel_stop_proportions(rows, output_path):
-    """
-    Plot the proportion of all generated progeny that contain:
-    - novel stop positions
-    - only original stop-position issues
-    """
-    generations = [r["generation"] for r in rows]
-    novel = [r["proportion_variants_with_novel_stops"] for r in rows]
-    original_only = [r["proportion_variants_with_only_original_stops"] for r in rows]
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(generations, novel, marker='o', label="Novel stop issues")
-    plt.plot(generations, original_only, marker='o', label="Only original stop issues")
-    plt.xlabel("Generation")
-    plt.ylabel("Proportion of all generated progeny")
-    plt.title("Novel Stop Composition over Time")
+    set_optional_ymax(ymax)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_stop_issue_breakdown(rows, output_path):
-    """
-    Plot the proportion among stop-issue progeny only:
-    - novel stop issues
-    - only original stop issues
-    """
-    generations = [r["generation"] for r in rows]
-    novel = [r["proportion_stop_variants_with_novel_stops"] for r in rows]
-    original_only = [r["proportion_stop_variants_with_only_original_stops"] for r in rows]
-
+def plot_novel_stop_proportions(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, novel, marker='o', label="Novel stop issues")
-    plt.plot(generations, original_only, marker='o', label="Only original stop issues")
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        novel = [r["proportion_variants_with_novel_stops"] for r in rows]
+        plt.plot(generations, novel, marker='o', label=label)
+
+    plt.xlabel("Generation")
+    plt.ylabel("Proportion of all generated progeny with novel stops")
+    plt.title("Novel Stop Proportion over Time")
+    set_optional_ymax(ymax)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_stop_issue_breakdown(datasets, output_path, ymax=None):
+    plt.figure(figsize=(8, 5))
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        novel = [r["proportion_stop_variants_with_novel_stops"] for r in rows]
+        original_only = [r["proportion_stop_variants_with_only_original_stops"] for r in rows]
+
+        plt.plot(generations, novel, marker='o', label=f"{label} novel")
+        plt.plot(generations, original_only, marker='x', linestyle='--', label=f"{label} original-only")
+
     plt.xlabel("Generation")
     plt.ylabel("Proportion of stop-issue progeny")
     plt.title("Breakdown of Stop-Issue Variants")
+    set_optional_ymax(ymax)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_viable_parent_count(rows, output_path):
-    """
-    Plot the number of viable parents out of 100 sampled per generation.
-    Includes a reference line at 100.
-    """
-    generations = [r["generation"] for r in rows]
-    viable_counts = [r["reproductive_parent_count"] for r in rows]
-
+def plot_viable_parent_count(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, viable_counts, marker='o', label="Viable parents")
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        viable_counts = [r["reproductive_parent_count"] for r in rows]
+        plt.plot(generations, viable_counts, marker='o', label=label)
+
     plt.axhline(y=100, linestyle='--', linewidth=1, label="Maximum (100)")
     plt.xlabel("Generation")
     plt.ylabel("Viable parents (out of 100 sampled)")
     plt.title("Viable Parents per 100 Sampled")
-    plt.ylim(0, 105)
+    set_optional_ymax(ymax)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
 
 
-def plot_viable_parent_proportion(rows, output_path):
-    """
-    Plot the proportion of viable parents per generation.
-    Includes a reference line at 1.0.
-    """
-    generations = [r["generation"] for r in rows]
-    viable_props = [r["viable_parent_proportion"] for r in rows]
-
+def plot_viable_parent_proportion(datasets, output_path, ymax=None):
     plt.figure(figsize=(8, 5))
-    plt.plot(generations, viable_props, marker='o', label="Viable proportion")
+
+    for ds in datasets:
+        rows = ds["rows"]
+        label = ds["label"]
+        generations = [r["generation"] for r in rows]
+        viable_props = [r["viable_parent_proportion"] for r in rows]
+        plt.plot(generations, viable_props, marker='o', label=label)
+
     plt.axhline(y=1.0, linestyle='--', linewidth=1, label="Maximum (1.0)")
     plt.xlabel("Generation")
     plt.ylabel("Proportion viable (out of 100)")
     plt.title("Proportion of Viable Parents per Generation")
-    plt.ylim(0, 1.05)
+    set_optional_ymax(ymax)
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
@@ -204,23 +259,108 @@ def plot_viable_parent_proportion(rows, output_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--summary-tsv", required=True)
+    parser.add_argument(
+        "--summary-tsv",
+        action="append",
+        required=True,
+        help="Path to a generation_summaries.tsv file. Repeat for multiple runs.",
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        required=True,
+        help="Label for the corresponding summary TSV. Repeat in same order as --summary-tsv.",
+    )
     parser.add_argument("--output-dir", required=True)
+
+    parser.add_argument(
+        "--plots",
+        nargs="+",
+        choices=PLOT_CHOICES,
+        default=PLOT_CHOICES,
+        help="Subset of plots to generate.",
+    )
+
+    parser.add_argument("--ymax-similarity", type=float, default=None)
+    parser.add_argument("--ymax-dnds", type=float, default=None)
+    parser.add_argument("--ymax-novel-stop-count", type=float, default=None)
+    parser.add_argument("--ymax-structurally-valid", type=float, default=None)
+    parser.add_argument("--ymax-novel-stop-proportion", type=float, default=None)
+    parser.add_argument("--ymax-stop-breakdown", type=float, default=None)
+    parser.add_argument("--ymax-viable-parent-count", type=float, default=None)
+    parser.add_argument("--ymax-viable-parent-proportion", type=float, default=None)
+
     args = parser.parse_args()
 
+    if len(args.summary_tsv) != len(args.label):
+        raise ValueError("You must provide the same number of --summary-tsv and --label arguments.")
+
     os.makedirs(args.output_dir, exist_ok=True)
-    rows = load_summary_tsv(args.summary_tsv)
 
-    plot_similarity(rows, os.path.join(args.output_dir, "mean_similarity_index_over_time.png"))
-    plot_dnds(rows, os.path.join(args.output_dir, "dnds_over_time.png"))
-    plot_novel_stop_counts(rows, os.path.join(args.output_dir, "novel_stop_variant_count_over_time.png"))
-    plot_structurally_valid_counts(rows, os.path.join(args.output_dir, "structurally_valid_variant_count_over_time.png"))
-    plot_novel_stop_proportions(rows, os.path.join(args.output_dir, "novel_stop_proportions_over_time.png"))
-    plot_stop_issue_breakdown(rows, os.path.join(args.output_dir, "novel_stop_breakdown_over_time.png"))
-    plot_viable_parent_count(rows, os.path.join(args.output_dir, "viable_parent_count_over_time.png"))
-    plot_viable_parent_proportion(rows, os.path.join(args.output_dir, "viable_parent_proportion_over_time.png"))
+    datasets = []
+    for path, label in zip(args.summary_tsv, args.label):
+        datasets.append({
+            "label": label,
+            "rows": load_summary_tsv(path),
+        })
 
-    print(f"Wrote plots to {args.output_dir}")
+    if "similarity" in args.plots:
+        plot_similarity(
+            datasets,
+            os.path.join(args.output_dir, "mean_similarity_index_over_time.png"),
+            ymax=args.ymax_similarity,
+        )
+
+    if "dnds" in args.plots:
+        plot_dnds(
+            datasets,
+            os.path.join(args.output_dir, "dnds_over_time.png"),
+            ymax=args.ymax_dnds,
+        )
+
+    if "novel_stop_count" in args.plots:
+        plot_novel_stop_counts(
+            datasets,
+            os.path.join(args.output_dir, "novel_stop_variant_count_over_time.png"),
+            ymax=args.ymax_novel_stop_count,
+        )
+
+    if "structurally_valid" in args.plots:
+        plot_structurally_valid_counts(
+            datasets,
+            os.path.join(args.output_dir, "structurally_valid_variant_count_over_time.png"),
+            ymax=args.ymax_structurally_valid,
+        )
+
+    if "novel_stop_proportion" in args.plots:
+        plot_novel_stop_proportions(
+            datasets,
+            os.path.join(args.output_dir, "novel_stop_proportions_over_time.png"),
+            ymax=args.ymax_novel_stop_proportion,
+        )
+
+    if "stop_breakdown" in args.plots:
+        plot_stop_issue_breakdown(
+            datasets,
+            os.path.join(args.output_dir, "novel_stop_breakdown_over_time.png"),
+            ymax=args.ymax_stop_breakdown,
+        )
+
+    if "viable_parent_count" in args.plots:
+        plot_viable_parent_count(
+            datasets,
+            os.path.join(args.output_dir, "viable_parent_count_over_time.png"),
+            ymax=args.ymax_viable_parent_count,
+        )
+
+    if "viable_parent_proportion" in args.plots:
+        plot_viable_parent_proportion(
+            datasets,
+            os.path.join(args.output_dir, "viable_parent_proportion_over_time.png"),
+            ymax=args.ymax_viable_parent_proportion,
+        )
+
+    print(f"Wrote selected plots to {args.output_dir}")
 
 
 if __name__ == "__main__":
